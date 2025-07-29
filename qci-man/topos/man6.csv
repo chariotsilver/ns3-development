@@ -1,0 +1,13 @@
+# u,v,kind,rate,delay
+s0,s1,core,10Gbps,0.5ms
+s1,s2,core,10Gbps,0.5ms
+s2,s3,core,10Gbps,0.5ms
+s3,s4,core,10Gbps,0.5ms
+s4,s5,core,10Gbps,0.5ms
+s5,s0,core,10Gbps,0.5ms
+h0,s0,spur,1Gbps,0.2ms
+h1,s1,spur,1Gbps,0.2ms
+h2,s2,spur,1Gbps,0.2ms
+h3,s3,spur,1Gbps,0.2ms
+h4,s4,spur,1Gbps,0.2ms
+h5,s5,spur,1Gbps,0.2ms
