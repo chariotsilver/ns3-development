@@ -19,12 +19,20 @@
 using namespace ns3;
 
 // Telemetry callbacks for queue monitoring
-void QdLen(std::string ctx, uint32_t oldVal, uint32_t newVal) {
-  std::cout << Simulator::Now().GetSeconds() << ",QLEN," << ctx << "," << newVal << "\n";
+void QdLen(uint32_t oldVal, uint32_t newVal) {
+  std::cout << Simulator::Now().GetSeconds() << ",QLEN,," << newVal << "\n";
 }
 
-void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
-  std::cout << Simulator::Now().GetSeconds() << ",DROP," << ctx << ",1\n";
+void QdDrop(Ptr<const QueueDiscItem> item) {
+  std::cout << Simulator::Now().GetSeconds() << ",DROP,,1\n";
+}
+
+static void QdLenTagged(std::string tag, uint32_t oldVal, uint32_t newVal) {
+  std::cout << Simulator::Now().GetSeconds() << ",QLEN," << tag << "," << newVal << "\n";
+}
+
+static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
+  std::cout << Simulator::Now().GetSeconds() << ",DROP," << tag << ",1\n";
 }
 
   class QkdWindowApp : public ns3::Application {
@@ -117,7 +125,7 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
       std::getline(ss,u,','); std::getline(ss,v,',');
       std::getline(ss,kind,','); std::getline(ss,rate,','); std::getline(ss,delay,',');
       Ptr<Node> nu = getNode(u), nv = getNode(v);
-      auto devs = Link(nu, nv, rate, delay);
+      auto devs = Link(nu, nv, rate, delay);  // Keep all CSMA for OFSwitch13 compatibility
       Edge e; e.a=nu; e.b=nv; e.devs=devs; e.kind=kind;
       e.nameA = u; e.nameB = v;  // Track node names for robust device selection
       if (kind=="core") tb.coreEdges.push_back(e); else tb.spurEdges.push_back(e);
@@ -138,12 +146,12 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
       m.host[i] = CreateObject<Node>(); 
     }
     
-    // Host spur links
+    // Host spur links (CSMA)
     for (uint32_t i = 0; i < nCore; i++) {
       m.hostLinks.push_back(Link(m.host[i], m.sw[i], spurRate, spurDelay));
     }
     
-    // Core topology: line by default, ring only if requested
+    // Core topology: line by default, ring only if requested (CSMA)
     for (uint32_t i = 0; i < nCore - 1; i++) {
       auto a = m.sw[i];
       auto b = m.sw[i + 1];
@@ -170,11 +178,11 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
     
     // QKD parameters
     uint32_t qSrc = 0, qDst = 1;
-    double qkdStart = 1.0, qkdDur = 1.5; 
-    uint32_t qkdPps = 100000;
+    double qkdStart = 1.0, qkdDur = 0.5; 
+    uint32_t qkdPps = 5000;  // Reduced from 100k to prevent event loop stress
     
     // Best-effort parameters
-    std::string beRate = "50Mbps";
+    std::string beRate = "10Mbps";  // Reduced from 50Mbps to prevent overwhelming
     
     // Topology parameters
     std::string topoPath = "";
@@ -296,7 +304,7 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
     }
     of13->CreateOpenFlowChannels();
 
-    // IP on hosts (this might automatically install default traffic control)
+    // IP on hosts
     InternetStackHelper internet;
     NodeContainer allHosts;
 
@@ -315,67 +323,33 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> fm = fmHelper.InstallAll();
 
-    // ---------------- QoS: install FQ-CoDel for smart queue management -------------
+    // ---------------- QoS: install FQ-CoDel only on host NICs -------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc");   // Good default for mixed UDP/TCP; reduces standing queues
+    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc");
 
-    // deterministic identity for a NIC
-    struct DevKey {
-      uint32_t node;
-      uint32_t ifidx;
-      bool operator<(const DevKey& o) const {
-        return (node < o.node) || (node == o.node && ifidx < o.ifidx);
+    // Check for existing qdiscs and remove them if they exist (some NS-3 versions auto-install)
+    for (uint32_t i = 0; i < hostDevs.GetN(); ++i) {
+      auto dev = hostDevs.Get(i);
+      auto tcl = dev->GetNode()->GetObject<TrafficControlLayer>();
+      auto existingQd = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr;
+      if (existingQd) {
+        tcl->DeleteRootQueueDiscOnDevice(dev);
       }
-    };
-
-    std::set<DevKey> done;
-
-    auto safeInstall = [&](Ptr<NetDevice> dev)
-    {
-      DevKey k{ dev->GetNode()->GetId(), dev->GetIfIndex() };
-
-      // Check if a root qdisc is already present on this device
-      Ptr<TrafficControlLayer> tcl = dev->GetNode()->GetObject<TrafficControlLayer>();
-      Ptr<QueueDisc> qdisc = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr;
-      bool hasQdisc = (qdisc != nullptr);
-
-      if (hasQdisc) {
-        std::cout << "SKIP (already has qdisc) node " << k.node << " if " << k.ifidx << "\n";
-        return;
-      }
-
-      if (done.insert(k).second) {
-        NetDeviceContainer c; c.Add(dev);
-        tch.Install(c);
-        std::cout << "TC -> node " << k.node << " if " << k.ifidx << "\n";
-      } else {
-        std::cout << "SKIP (dup key) node " << k.node << " if " << k.ifidx << "\n";
-      }
-    };
-
-    // Step A: Start with host-only TC first (zero-risk staging)
-    for (auto& hl : spurLinks) {
-      safeInstall(hl.Get(0)); // host NIC only
     }
 
-    // Step B: Add core link ends for priority within the fabric
-    for (auto& cl : coreLinks) {
-      safeInstall(cl.Get(0));
-      safeInstall(cl.Get(1));
+    // Install exactly once; keep the returned handles
+    QueueDiscContainer hostQdiscs = tch.Install(hostDevs);
+
+    // Attach telemetry only to what you just installed
+    for (uint32_t i = 0; i < hostQdiscs.GetN(); ++i) {
+      Ptr<QueueDisc> qd = hostQdiscs.Get(i);
+      std::string tag = "node" + std::to_string(hostDevs.Get(i)->GetNode()->GetId()) +
+                        "/dev" + std::to_string(hostDevs.Get(i)->GetIfIndex());
+      qd->TraceConnectWithoutContext("PacketsInQueue",
+          MakeBoundCallback(&QdLenTagged, tag));
+      qd->TraceConnectWithoutContext("Drop",
+          MakeBoundCallback(&QdDropTagged, tag));
     }
-
-    // Step C: Add switch-side spur links for complete coverage
-    for (auto& hl : spurLinks) {
-      safeInstall(hl.Get(1)); // switch NIC
-    }
-
-    std::cout << "TC installed on " << done.size() << " devices (comprehensive)\n";
-
-    // Connect queue monitoring callbacks for telemetry
-    Config::Connect("/NodeList/*/$ns3::TrafficControlLayer/RootQueueDiscList/*/PacketsInQueue",
-                    MakeCallback(&QdLen));
-    Config::Connect("/NodeList/*/$ns3::TrafficControlLayer/RootQueueDiscList/*/Drop",
-                    MakeCallback(&QdDrop));
 
     // Best-effort background traffic (deterministic pairing)
     uint16_t bePort = 9000;
@@ -418,7 +392,7 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
     }
 
     // ARP warmup: prime caches to avoid losing first QKD packets
-    V4PingHelper warm(ifs.GetAddress((qSrc+1) % numHosts));
+    V4PingHelper warm(ifs.GetAddress(qDst));
     warm.SetAttribute("StartTime", TimeValue(Seconds(0.2)));
     if (usingCsv) {
       warm.Install(hostByIndex[qSrc]);
