@@ -366,6 +366,10 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
     NS_ABORT_MSG_IF(qSrc >= numHosts || qDst >= numHosts,
       "qSrc/qDst out of range for number of hosts (" << numHosts << ")");
     
+    // Safety check: ensure even host count for proper pairing
+    NS_ABORT_MSG_IF(numHosts % 2 != 0,
+      "Pairing requires an even number of hosts (j=(i+numHosts/2)%numHosts).");
+    
     for (uint32_t i = 0; i < numHosts; i++) {
       uint32_t j = (i + numHosts/2) % numHosts;  // Deterministic pairing
       
