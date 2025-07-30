@@ -17,8 +17,219 @@
 #include <set>
 #include <map>
 #include <iostream>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
 
 using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("SpProactiveController");
+
+// ---- Proactive Shortest-Path Controller ----
+
+// IDs we'll use internally
+using Sw = uint64_t;     // switch id (DPID) or Node->GetId() mapped to DPID
+using Port = uint32_t;   // OpenFlow port number (1-based)
+using Host = uint32_t;   // host index (h0,h1,...)
+
+struct HostInfo {
+  Mac48Address mac;
+  Ipv4Address  ip;
+  Sw           edgeSw;
+  Port         edgePort;  // port on edge switch facing the host
+};
+
+struct PortPeer {
+  bool isSwitch{false};
+  Sw   sw{};
+  Host host{};
+};
+
+// Switch adjacency: on switch S, port p leads to either another switch or a host
+using PortMap = std::unordered_map<Port, PortPeer>;
+using SwAdj   = std::unordered_map<Sw, PortMap>;
+
+class SpProactiveController : public OFSwitch13Controller {
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("SpProactiveController")
+      .SetParent<OFSwitch13Controller>()
+      .SetGroupName("OFSwitch13")
+      .AddConstructor<SpProactiveController>();
+    return tid;
+  }
+
+  // Inject topology and hosts before StartApplication()
+  void SetAdjacency(const SwAdj& adj) { m_adj = adj; }
+  void SetHosts(const std::vector<HostInfo>& hosts) { m_hosts = hosts; }
+
+  // Set NodeId->DPID mapping for remapping topology when switches connect
+  void SetNodeIdToDpid(const std::unordered_map<uint32_t, Sw>& map) { m_nodeIdToDpid = map; }
+
+  // Flag to indicate if topology uses NodeId keys that need remapping
+  void SetNeedsRemapping(bool needs) { m_needsRemapping = needs; }
+
+protected:
+  virtual void HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) override {
+    uint64_t dpid = swtch->GetDpId();
+    NS_LOG_INFO("SpProactiveController: Switch connected DPID=" << dpid);
+    std::cout << "DEBUG: HandshakeSuccessful called for switch DPID " << dpid << std::endl;
+    
+    // Store the DPID->node mapping for debugging
+    m_connectedSwitches.insert(dpid);
+    std::cout << "DEBUG: " << m_connectedSwitches.size() << " switches connected so far" << std::endl;
+    
+    // If this is the first switch and we need remapping, perform NodeId->DPID conversion
+    if (m_needsRemapping && m_connectedSwitches.size() == 1) {
+      RemapTopologyToDpids();
+    }
+    
+    // Install table-miss drop and flows for this switch immediately
+    InstallTableMissDrop(dpid);
+    PushFlowsForSwitch(dpid);
+  }
+
+private:
+  void InstallTableMissDrop(uint64_t dpid) {
+    // Install lowest priority rule to drop unmatched packets
+    DpctlExecute(dpid, "flow-mod cmd=add,table=0,prio=0");
+  }
+
+  void RemapTopologyToDpids() {
+    std::cout << "DEBUG: Remapping topology from NodeId to DPID keys" << std::endl;
+    
+    // Build NodeId -> DPID map from connected switches
+    std::unordered_map<uint32_t, Sw> nodeToDpid;
+    for (auto& [nodeId, dpid] : m_nodeIdToDpid) {
+      nodeToDpid[nodeId] = dpid;
+      std::cout << "DEBUG: NodeId " << nodeId << " -> DPID " << dpid << std::endl;
+    }
+    
+    // Remap adjacency from NodeId to DPID keys
+    SwAdj adjByDpid;
+    for (auto &kv : m_adj) {
+      auto nodeIdIt = nodeToDpid.find(kv.first);
+      if (nodeIdIt == nodeToDpid.end()) continue; // Skip if NodeId not found
+      
+      Sw srcDpid = nodeIdIt->second;
+      for (auto &pkv : kv.second) {
+        Port port = pkv.first;
+        auto peer = pkv.second;
+        PortPeer npeer = peer;
+        if (peer.isSwitch) {
+          auto peerNodeIdIt = nodeToDpid.find(peer.sw);
+          if (peerNodeIdIt != nodeToDpid.end()) {
+            npeer.sw = peerNodeIdIt->second; // convert NodeId -> DPID
+          }
+        }
+        adjByDpid[srcDpid][port] = npeer;
+      }
+    }
+    
+    // Remap hosts from NodeId to DPID keys
+    for (auto &h : m_hosts) {
+      auto nodeIdIt = nodeToDpid.find(static_cast<uint32_t>(h.edgeSw));
+      if (nodeIdIt != nodeToDpid.end()) {
+        h.edgeSw = nodeIdIt->second;
+      }
+    }
+    
+    // Update internal state
+    m_adj = adjByDpid;
+    m_needsRemapping = false;
+    std::cout << "DEBUG: Topology remapped to DPID keys" << std::endl;
+  }
+
+  void PushFlowsForSwitch(uint64_t dpid) {
+    std::cout << "DEBUG: PushFlowsForSwitch called for DPID " << dpid << std::endl;
+    std::cout << "DEBUG: Host table has " << m_hosts.size() << " entries" << std::endl;
+    
+    // Install ARP and IPv4 rules for all hosts that can reach this switch
+    for (const auto& host : m_hosts) {
+      Port outPort;
+      if (dpid == host.edgeSw) {
+        outPort = host.edgePort; // Direct delivery to host
+        std::cout << "DEBUG: Host " << host.ip << " is directly connected to DPID " << dpid << " on port " << outPort << std::endl;
+      } else {
+        if (!NextHopPort(dpid, host.edgeSw, outPort)) {
+          std::cout << "DEBUG: No path from DPID " << dpid << " to host " << host.ip << " (edgeSw=" << host.edgeSw << ")" << std::endl;
+          continue;
+        }
+        std::cout << "DEBUG: Host " << host.ip << " reachable from DPID " << dpid << " via port " << outPort << std::endl;
+      }
+      
+      // Install ARP rule (higher priority)
+      std::ostringstream arpCmd;
+      arpCmd << "flow-mod cmd=add,table=0,prio=200"
+             << " eth_type=0x0806,arp_tpa=" << host.ip
+             << " apply:output=" << outPort;
+      std::cout << "DEBUG: Installing ARP rule: " << arpCmd.str() << std::endl;
+      DpctlExecute(dpid, arpCmd.str());
+
+      // Install IPv4 rule
+      std::ostringstream ipCmd;
+      ipCmd << "flow-mod cmd=add,table=0,prio=100"
+            << " eth_type=0x0800,eth_dst=" << host.mac
+            << " apply:output=" << outPort;
+      std::cout << "DEBUG: Installing IPv4 rule: " << ipCmd.str() << std::endl;
+      DpctlExecute(dpid, ipCmd.str());
+    }
+  }
+
+  bool NextHopPort(Sw src, Sw dst, Port& outPort) {
+    if (src == dst) return false;
+
+    std::queue<Sw> q;
+    std::unordered_map<Sw, Sw> parent;
+    std::unordered_set<Sw> visited;
+
+    q.push(src);
+    visited.insert(src);
+    parent[src] = src;
+
+    while (!q.empty()) {
+      Sw curr = q.front();
+      q.pop();
+
+      if (curr == dst) {
+        // Trace back to find next hop
+        Sw next = dst;
+        while (parent[next] != src) {
+          next = parent[next];
+        }
+        auto it = m_adj.find(src);
+        if (it != m_adj.end()) {
+          for (const auto& [port, peer] : it->second) {
+            if (peer.isSwitch && peer.sw == next) {
+              outPort = port;
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      auto it = m_adj.find(curr);
+      if (it != m_adj.end()) {
+        for (const auto& [port, peer] : it->second) {
+          if (peer.isSwitch && visited.find(peer.sw) == visited.end()) {
+            visited.insert(peer.sw);
+            parent[peer.sw] = curr;
+            q.push(peer.sw);
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+private:
+  SwAdj m_adj;
+  std::vector<HostInfo> m_hosts;
+  std::unordered_map<uint32_t, Sw> m_nodeIdToDpid;
+  std::set<uint64_t> m_connectedSwitches;
+  bool m_needsRemapping{false};
+};
 
 // Telemetry callbacks for queue monitoring
 void QdLen(uint32_t oldVal, uint32_t newVal) {
@@ -76,12 +287,12 @@ static void PollQ(QueueDiscContainer qds) {
     Time m_start, m_dur, m_interval; uint32_t m_pktSize{400}; bool m_on{false};
   };
 
-  static NetDeviceContainer Link(Ptr<Node>a, Ptr<Node>b, std::string rate, std::string delay)
+  static NetDeviceContainer Link(Ptr<Node>a, Ptr<Node>b, std::string rate, std::string delay, uint32_t txQueueMaxP = 25)
   {
     CsmaHelper csma;
     csma.SetChannelAttribute("DataRate", StringValue(rate));
     csma.SetChannelAttribute("Delay",   StringValue(delay));
-    csma.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize("100p"))); // keep near qdisc cap
+    csma.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize(std::to_string(txQueueMaxP) + "p"))); // configurable queue size
     return csma.Install(NodeContainer(a,b));
   }
 
@@ -138,7 +349,7 @@ static void PollQ(QueueDiscContainer qds) {
       std::getline(ss,u,','); std::getline(ss,v,',');
       std::getline(ss,kind,','); std::getline(ss,rate,','); std::getline(ss,delay,',');
       Ptr<Node> nu = getNode(u), nv = getNode(v);
-      auto devs = Link(nu, nv, rate, delay);  // Keep all CSMA for OFSwitch13 compatibility
+      auto devs = Link(nu, nv, rate, delay, 25);  // Keep all CSMA for OFSwitch13 compatibility, use default txQueueMaxP for CSV links
       Edge e; e.a=nu; e.b=nv; e.devs=devs; e.kind=kind;
       e.nameA = u; e.nameB = v;  // Track node names for robust device selection
       if (kind=="core") tb.coreEdges.push_back(e); else tb.spurEdges.push_back(e);
@@ -147,7 +358,7 @@ static void PollQ(QueueDiscContainer qds) {
   }
 
   Man BuildMan(uint32_t nCore, std::string coreRate, std::string coreDelay,
-              std::string spurRate, std::string spurDelay, bool enableRing = false)
+              std::string spurRate, std::string spurDelay, bool enableRing = false, uint32_t txQueueMaxP = 25)
   {
     Man m; 
     m.sw.resize(nCore); 
@@ -161,24 +372,69 @@ static void PollQ(QueueDiscContainer qds) {
     
     // Host spur links (CSMA)
     for (uint32_t i = 0; i < nCore; i++) {
-      m.hostLinks.push_back(Link(m.host[i], m.sw[i], spurRate, spurDelay));
+      m.hostLinks.push_back(Link(m.host[i], m.sw[i], spurRate, spurDelay, txQueueMaxP));
     }
     
     // Core topology: line by default, ring only if requested (CSMA)
     for (uint32_t i = 0; i < nCore - 1; i++) {
       auto a = m.sw[i];
       auto b = m.sw[i + 1];
-      m.coreLinks.push_back(Link(a, b, coreRate, coreDelay));
+      m.coreLinks.push_back(Link(a, b, coreRate, coreDelay, txQueueMaxP));
     }
     
     // Close the ring only if explicitly enabled AND we have >2 switches
     if (enableRing && nCore > 2) {
       auto a = m.sw[nCore - 1];
       auto b = m.sw[0];
-      m.coreLinks.push_back(Link(a, b, coreRate, coreDelay));
+      m.coreLinks.push_back(Link(a, b, coreRate, coreDelay, txQueueMaxP));
     }
     
     return m;
+  }
+
+  // Generic adjacency and host builder that works for both built-in and CSV topologies
+  static void BuildAdjAndHosts_Generic(
+    bool usingCsv,
+    const std::vector< NetDeviceContainer >& coreLinks,
+    const std::vector< NetDeviceContainer >& spurLinks,
+    const std::unordered_map<Ptr<NetDevice>, std::pair<uint32_t, Port>>& devToPortByNode,
+    const std::unordered_map<Ptr<NetDevice>, Ipv4Address>& devToIp,
+    const std::vector<Edge>* csvSpurs,  // pass &topo.spurEdges if CSV, else nullptr
+    SwAdj& adj,
+    std::vector<HostInfo>& hosts)
+  {
+    adj.clear(); hosts.clear();
+
+    // S–S links: both ends will be in devToPortByNode (because both are switch NICs)
+    for (const auto &link : coreLinks) {
+      auto a = link.Get(0), b = link.Get(1);
+      auto [aNode, aPort] = devToPortByNode.at(a);
+      auto [bNode, bPort] = devToPortByNode.at(b);
+      // We'll swap to real DPID in §4
+      adj[aNode][aPort] = PortPeer{true, bNode, 0};
+      adj[bNode][bPort] = PortPeer{true, aNode, 0};
+    }
+
+    // Host spurs: one end is in devToPortByNode (switch side), the other isn't (host NIC)
+    for (const auto &spur : spurLinks) {
+      Ptr<NetDevice> d0 = spur.Get(0), d1 = spur.Get(1);
+      Ptr<NetDevice> swNic = nullptr, hostNic = nullptr;
+      auto it0 = devToPortByNode.find(d0), it1 = devToPortByNode.find(d1);
+
+      if (it0 != devToPortByNode.end() && it1 == devToPortByNode.end()) {
+        swNic = d0; hostNic = d1;
+      } else if (it1 != devToPortByNode.end() && it0 == devToPortByNode.end()) {
+        swNic = d1; hostNic = d0;
+      } else {
+        NS_FATAL_ERROR("spur link did not look like host<->switch");
+      }
+
+      auto [swNode, swPort] = devToPortByNode.at(swNic);
+      Mac48Address mac = Mac48Address::ConvertFrom(hostNic->GetAddress());
+      Ipv4Address  ip  = devToIp.at(hostNic);
+
+      hosts.push_back( HostInfo{ mac, ip, /*edgeSw*/ Sw(swNode), /*edgePort*/ swPort } );
+    }
   }
 
   int main(int argc, char** argv)
@@ -201,6 +457,9 @@ static void PollQ(QueueDiscContainer qds) {
     std::string topoPath = "";
     bool enableRing = false;
     
+    // Queue parameters
+    uint32_t qdiscMaxP = 100, txQueueMaxP = 25;
+    
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
     cmd.AddValue("run", "RNG run number", run);
@@ -213,6 +472,8 @@ static void PollQ(QueueDiscContainer qds) {
     cmd.AddValue("qkdDur", "QKD window duration (s)", qkdDur);
     cmd.AddValue("qkdPps", "QKD packets per second", qkdPps);
     cmd.AddValue("beRate", "Best-effort data rate", beRate);
+    cmd.AddValue("qdiscMaxP", "FQ-CoDel MaxSize in packets", qdiscMaxP);
+    cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -227,19 +488,26 @@ static void PollQ(QueueDiscContainer qds) {
     if (usingCsv) {
       topo = BuildFromCsv(topoPath);
     } else {
-      man = BuildMan(nCore, "10Gbps", "0.5ms", "1Gbps", "0.2ms", enableRing);
+      man = BuildMan(nCore, "10Gbps", "0.5ms", "1Gbps", "0.2ms", enableRing, txQueueMaxP);
     }
     
-    // OFSwitch13 setup with controller node
+    // --- Create the proactive controller and wire topology info ---
     Ptr<Node> controllerNode = CreateObject<Node>();
+    Ptr<SpProactiveController> ctrl = CreateObject<SpProactiveController>();
+
+    // Install controller and switches then open channels
     Ptr<OFSwitch13InternalHelper> of13 = CreateObject<OFSwitch13InternalHelper>();
-    of13->InstallController(controllerNode);
 
     // Build network device collections first
     NetDeviceContainer hostDevs;
     std::vector< NetDeviceContainer > spurLinks;
     std::vector< NetDeviceContainer > coreLinks;
     std::vector<Ptr<Node>> hostByIndex;  // CSV mode: nodes in IP assignment order
+
+    // Map to track device -> (switch nodeId, port) for robust adjacency building
+    std::unordered_map<Sw, NetDeviceContainer> swPorts; // nodeId -> ports (in exact order passed)
+    std::unordered_map<Ptr<NetDevice>, std::pair<uint32_t /*nodeId*/, Port>> devToPortByNode;
+    std::unordered_map<Ptr<NetDevice>, Ipv4Address> devToIp;
 
     if (usingCsv) {
       // Build stable host index mapping for proper IP assignment
@@ -285,6 +553,9 @@ static void PollQ(QueueDiscContainer qds) {
           if (e.b == swNode) ports.Add(e.devs.Get(1));
         }
         of13->InstallSwitch(swNode, ports);
+        
+        // Record nodeId -> ports mapping (using nodeId as temporary key)
+        swPorts[swNode->GetId()] = ports;
       }
     } else {
       // Built-in topology: wire switch ports correctly for line/ring
@@ -313,11 +584,27 @@ static void PollQ(QueueDiscContainer qds) {
         }
         
         of13->InstallSwitch(man.sw[i], ports);
+        std::cout << "DEBUG: Installed switch " << i << " (nodeId=" << man.sw[i]->GetId() << ") with " << ports.GetN() << " ports" << std::endl;
+        
+        // Record nodeId -> ports mapping (using nodeId as temporary key)
+        swPorts[man.sw[i]->GetId()] = ports;
       }
     }
-    of13->CreateOpenFlowChannels();
 
-    // IP on hosts
+    // Build device -> (nodeId, port) index
+    for (auto &kv : swPorts) {
+      uint32_t nodeId = kv.first;                 // temporary key = switch NodeId
+      const auto &plist = kv.second;
+      for (uint32_t i = 0; i < plist.GetN(); ++i) {
+        devToPortByNode[ plist.Get(i) ] = { nodeId, Port(i+1) }; // OpenFlow ports are 1-based
+      }
+    }
+
+    // (B) Install controller object (no learning controller)
+    of13->InstallController(controllerNode, ctrl);
+    std::cout << "DEBUG: Installed controller" << std::endl;
+
+    // (C) Install Internet + assign IPs
     InternetStackHelper internet;
     NodeContainer allHosts;
 
@@ -332,6 +619,42 @@ static void PollQ(QueueDiscContainer qds) {
     ipv4.SetBase("10.0.0.0", "255.255.255.0");
     Ipv4InterfaceContainer ifs = ipv4.Assign(hostDevs);
 
+    // Build device -> IP mapping for host NICs (so we never rely on spur order)
+    for (uint32_t k = 0; k < hostDevs.GetN(); ++k) {
+      devToIp[ hostDevs.Get(k) ] = ifs.GetAddress(k);
+    }
+
+    // (D) Build dev/port maps + adjacency + hosts (with NodeId keys initially)
+    SwAdj adj; 
+    std::vector<HostInfo> hostTbl;
+    const std::vector<Edge>* csvSpursPtr = usingCsv ? &topo.spurEdges : nullptr;
+    BuildAdjAndHosts_Generic(usingCsv, coreLinks, spurLinks, devToPortByNode, devToIp, csvSpursPtr, adj, hostTbl);
+
+    // Build NodeId -> DPID mapping before switches connect
+    std::unordered_map<uint32_t, Sw> nodeToDpid;
+    std::vector<Ptr<Node>> swNodes;
+    if (usingCsv) swNodes = topo.sw; else swNodes = man.sw;
+
+    // For built-in topology, create sequential DPID mapping (1,2,3,4...)
+    // For CSV topology, we'll use the same pattern
+    uint64_t dpidCounter = 1;
+    for (auto swNode : swNodes) {
+      // Use sequential DPIDs starting from 1 to ensure connected topology
+      nodeToDpid[swNode->GetId()] = dpidCounter++;
+      std::cout << "DEBUG: Will map NodeId " << swNode->GetId() << " -> DPID " << nodeToDpid[swNode->GetId()] << std::endl;
+    }
+
+    // Set topology on controller with remapping info
+    ctrl->SetAdjacency(adj);
+    ctrl->SetHosts(hostTbl);
+    ctrl->SetNodeIdToDpid(nodeToDpid);
+    ctrl->SetNeedsRemapping(true);
+    std::cout << "DEBUG: Configured controller with " << adj.size() << " switches and " << hostTbl.size() << " hosts (NodeId keys, will remap to DPID)" << std::endl;
+
+    // (E) Only now open channels so HandshakeSuccessful() pushes flows with populated data
+    of13->CreateOpenFlowChannels();  // controller will push flows on handshake
+    std::cout << "DEBUG: Created OpenFlow channels" << std::endl;
+
     // Install FlowMonitor for per-flow telemetry
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> fm = fmHelper.InstallAll();
@@ -339,7 +662,7 @@ static void PollQ(QueueDiscContainer qds) {
     // ---------------- QoS: ensure FQ-CoDel (bounded) on host NICs ----------------
     TrafficControlHelper tch;
     tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc",
-                         "MaxSize", QueueSizeValue(QueueSize("100p"))); // tune: 64–128p typical
+                         "MaxSize", QueueSizeValue(QueueSize(std::to_string(qdiscMaxP) + "p"))); // configurable qdisc size
 
     QueueDiscContainer hostQdiscs;
 
