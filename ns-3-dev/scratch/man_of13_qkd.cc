@@ -315,9 +315,9 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> fm = fmHelper.InstallAll();
 
-    // ---------------- QoS: install pfifo_fast once per *unique* device -------------
+    // ---------------- QoS: install FQ-CoDel for smart queue management -------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
+    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc");   // Good default for mixed UDP/TCP; reduces standing queues
 
     // deterministic identity for a NIC
     struct DevKey {
@@ -418,7 +418,7 @@ void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
     }
 
     // ARP warmup: prime caches to avoid losing first QKD packets
-    PingHelper warm(ifs.GetAddress((qSrc+1) % numHosts));
+    V4PingHelper warm(ifs.GetAddress((qSrc+1) % numHosts));
     warm.SetAttribute("StartTime", TimeValue(Seconds(0.2)));
     if (usingCsv) {
       warm.Install(hostByIndex[qSrc]);
