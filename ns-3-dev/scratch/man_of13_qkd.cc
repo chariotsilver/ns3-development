@@ -7,6 +7,7 @@
 #include "ns3/traffic-control-module.h"
 #include "ns3/traffic-control-layer.h"
 #include "ns3/ofswitch13-module.h"
+#include "ns3/flow-monitor-module.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/rng-seed-manager.h"
 #include <fstream>
@@ -16,6 +17,15 @@
 #include <iostream>
 
 using namespace ns3;
+
+// Telemetry callbacks for queue monitoring
+void QdLen(std::string ctx, uint32_t oldVal, uint32_t newVal) {
+  std::cout << Simulator::Now().GetSeconds() << ",QLEN," << ctx << "," << newVal << "\n";
+}
+
+void QdDrop(std::string ctx, Ptr<const QueueDiscItem> item) {
+  std::cout << Simulator::Now().GetSeconds() << ",DROP," << ctx << ",1\n";
+}
 
   class QkdWindowApp : public ns3::Application {
   public:
@@ -301,6 +311,10 @@ using namespace ns3;
     ipv4.SetBase("10.0.0.0", "255.255.255.0");
     Ipv4InterfaceContainer ifs = ipv4.Assign(hostDevs);
 
+    // Install FlowMonitor for per-flow telemetry
+    FlowMonitorHelper fmHelper;
+    Ptr<FlowMonitor> fm = fmHelper.InstallAll();
+
     // ---------------- QoS: install pfifo_fast once per *unique* device -------------
     TrafficControlHelper tch;
     tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
@@ -356,6 +370,12 @@ using namespace ns3;
     }
 
     std::cout << "TC installed on " << done.size() << " devices (comprehensive)\n";
+
+    // Connect queue monitoring callbacks for telemetry
+    Config::Connect("/NodeList/*/$ns3::TrafficControlLayer/RootQueueDiscList/*/PacketsInQueue",
+                    MakeCallback(&QdLen));
+    Config::Connect("/NodeList/*/$ns3::TrafficControlLayer/RootQueueDiscList/*/Drop",
+                    MakeCallback(&QdDrop));
 
     // Best-effort background traffic (deterministic pairing)
     uint16_t bePort = 9000;
@@ -431,6 +451,10 @@ using namespace ns3;
 
     Simulator::Stop(Seconds(3.0));
     Simulator::Run();
+    
+    // FlowMonitor telemetry output
+    fm->CheckForLostPackets();
+    fm->SerializeToXmlFile("flows.xml", true, true);
     
     // Results
     uint64_t totalBeRx = 0;
