@@ -37,6 +37,16 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
   std::cout << Simulator::Now().GetSeconds() << ",DROP," << tag << ",1\n";
 }
 
+static void PollQ(QueueDiscContainer qds) {
+  for (uint32_t i = 0; i < qds.GetN(); ++i) {
+    auto qd = qds.Get(i);
+    std::cout << Simulator::Now().GetSeconds() << ",QSIZE_OBJ,"
+             << qd->GetCurrentSize().GetValue()
+             << ",MAX=" << qd->GetMaxSize().GetValue() << "\n";
+  }
+  Simulator::Schedule(MilliSeconds(1), &PollQ, qds);
+}
+
   class QkdWindowApp : public ns3::Application {
   public:
     void Configure(Ptr<Node> n, Ipv4Address dst, uint16_t dport,
@@ -356,6 +366,9 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
       qd->TraceConnectWithoutContext("PacketsInQueue", MakeBoundCallback(&QdLenTagged, tag));
       qd->TraceConnectWithoutContext("Drop",           MakeBoundCallback(&QdDropTagged, tag));
     }
+
+    // Object-based queue size polling for verification
+    Simulator::Schedule(Seconds(0.4), &PollQ, hostQdiscs);
 
     // Best-effort background traffic (deterministic pairing)
     uint16_t bePort = 9000;
