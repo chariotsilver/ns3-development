@@ -6,6 +6,8 @@
 #include "ns3/internet-apps-module.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/traffic-control-layer.h"
+#include "ns3/fq-codel-queue-disc.h"
+#include "ns3/queue-size.h"
 #include "ns3/ofswitch13-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/random-variable-stream.h"
@@ -323,32 +325,35 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> fm = fmHelper.InstallAll();
 
-    // ---------------- QoS: install FQ-CoDel only on host NICs -------------
+    // ---------------- QoS: ensure FQ-CoDel (bounded) on host NICs ----------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc");
+    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc",
+                         "MaxSize", QueueSizeValue(QueueSize("100p"))); // tune: 64–128p typical
 
-    // Check for existing qdiscs and remove them if they exist (some NS-3 versions auto-install)
+    QueueDiscContainer hostQdiscs;
+
     for (uint32_t i = 0; i < hostDevs.GetN(); ++i) {
-      auto dev = hostDevs.Get(i);
-      auto tcl = dev->GetNode()->GetObject<TrafficControlLayer>();
-      auto existingQd = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr;
+      Ptr<NetDevice> dev = hostDevs.Get(i);
+      Ptr<TrafficControlLayer> tcl = dev->GetNode()->GetObject<TrafficControlLayer>();
+      
+      // Always delete existing qdisc to ensure fresh installation with correct parameters
+      Ptr<QueueDisc> existingQd = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr;
       if (existingQd) {
         tcl->DeleteRootQueueDiscOnDevice(dev);
       }
+      
+      // Install fresh FQ-CoDel with specified MaxSize
+      QueueDiscContainer c = tch.Install(NetDeviceContainer(dev));
+      hostQdiscs.Add(c.Get(0));
     }
 
-    // Install exactly once; keep the returned handles
-    QueueDiscContainer hostQdiscs = tch.Install(hostDevs);
-
-    // Attach telemetry only to what you just installed
+    // Attach telemetry with tags
     for (uint32_t i = 0; i < hostQdiscs.GetN(); ++i) {
       Ptr<QueueDisc> qd = hostQdiscs.Get(i);
       std::string tag = "node" + std::to_string(hostDevs.Get(i)->GetNode()->GetId()) +
                         "/dev" + std::to_string(hostDevs.Get(i)->GetIfIndex());
-      qd->TraceConnectWithoutContext("PacketsInQueue",
-          MakeBoundCallback(&QdLenTagged, tag));
-      qd->TraceConnectWithoutContext("Drop",
-          MakeBoundCallback(&QdDropTagged, tag));
+      qd->TraceConnectWithoutContext("PacketsInQueue", MakeBoundCallback(&QdLenTagged, tag));
+      qd->TraceConnectWithoutContext("Drop",           MakeBoundCallback(&QdDropTagged, tag));
     }
 
     // Best-effort background traffic (deterministic pairing)
@@ -400,28 +405,36 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
       warm.Install(man.host[qSrc]);
     }
 
-    // QKD window: high-priority EF traffic
-    Ptr<QkdWindowApp> qkd = CreateObject<QkdWindowApp>();
-    if (usingCsv) {
-      hostByIndex[qSrc]->AddApplication(qkd);
-      qkd->Configure(hostByIndex[qSrc], ifs.GetAddress(qDst), /*dport*/ 5555,
-                    Seconds(qkdStart), Seconds(qkdDur),
-                    /*pktSize*/ 400, /*pps*/ qkdPps);
-    } else {
-      man.host[qSrc]->AddApplication(qkd);
-      qkd->Configure(man.host[qSrc], ifs.GetAddress(qDst), /*dport*/ 5555,
-                    Seconds(qkdStart), Seconds(qkdDur),
-                    /*pktSize*/ 400, /*pps*/ qkdPps);
-    }
-                  
-    PacketSinkHelper qkds("ns3::UdpSocketFactory", 
-                        InetSocketAddress(Ipv4Address::GetAny(), 5555));
-    ApplicationContainer qkdsink;
-    if (usingCsv) {
-      qkdsink = qkds.Install(hostByIndex[qDst]);
-    } else {
-      qkdsink = qkds.Install(man.host[qDst]);
-    }
+    // --- old bulk EF QKD window (commented out) ---
+    // Ptr<QkdWindowApp> qkd = CreateObject<QkdWindowApp>();
+    // if (usingCsv) {
+    //   hostByIndex[qSrc]->AddApplication(qkd);
+    //   qkd->Configure(hostByIndex[qSrc], ifs.GetAddress(qDst), /*dport*/ 5555,
+    //                 Seconds(qkdStart), Seconds(qkdDur),
+    //                 /*pktSize*/ 400, /*pps*/ qkdPps);
+    // } else {
+    //   man.host[qSrc]->AddApplication(qkd);
+    //   qkd->Configure(man.host[qSrc], ifs.GetAddress(qDst), /*dport*/ 5555,
+    //                 Seconds(qkdStart), Seconds(qkdDur),
+    //                 /*pktSize*/ 400, /*pps*/ qkdPps);
+    // }
+
+    // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst
+    uint16_t qctrlPort = 5555;
+    OnOffHelper qctrl("ns3::UdpSocketFactory",
+                      InetSocketAddress(ifs.GetAddress(qDst), qctrlPort));
+    qctrl.SetAttribute("DataRate", StringValue("64kbps"));   // tiny control rate
+    qctrl.SetAttribute("PacketSize", UintegerValue(200));
+    qctrl.SetAttribute("StartTime", TimeValue(Seconds(qkdStart)));
+    qctrl.SetAttribute("OnTime",  StringValue("ns3::ConstantRandomVariable[Constant=1e9]"));
+    qctrl.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+    (usingCsv ? qctrl.Install(hostByIndex[qSrc]) : qctrl.Install(man.host[qSrc]));
+
+    PacketSinkHelper qctrlSink("ns3::UdpSocketFactory",
+                               InetSocketAddress(Ipv4Address::GetAny(), qctrlPort));
+    ApplicationContainer qctrlSinkApp = (usingCsv
+      ? qctrlSink.Install(hostByIndex[qDst])
+      : qctrlSink.Install(man.host[qDst]));
 
     Simulator::Stop(Seconds(3.0));
     Simulator::Run();
@@ -435,7 +448,7 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
     for (uint32_t i = 0; i < sinkApps.GetN(); i++) {
       totalBeRx += DynamicCast<PacketSink>(sinkApps.Get(i))->GetTotalRx();
     }
-    auto qkdRx = DynamicCast<PacketSink>(qkdsink.Get(0))->GetTotalRx();
+    auto qctrlRx = DynamicCast<PacketSink>(qctrlSinkApp.Get(0))->GetTotalRx();
     
     if (usingCsv) {
       std::cout << "MAN from CSV: " << topoPath << " (" << topo.host.size() << " hosts)\n";
@@ -443,7 +456,7 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
       std::cout << "MAN with " << nCore << " core switches\n";
     }
     std::cout << "Total BE RX: " << totalBeRx << " bytes\n";
-    std::cout << "QKD RX (host" << qSrc << "→host" << qDst << "): " << qkdRx << " bytes\n";
+    std::cout << "QKD control RX (host" << qSrc << "→host" << qDst << "): " << qctrlRx << " bytes\n";
     
     Simulator::Destroy();
     return 0;
