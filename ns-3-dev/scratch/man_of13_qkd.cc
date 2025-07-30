@@ -71,6 +71,7 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
     CsmaHelper csma;
     csma.SetChannelAttribute("DataRate", StringValue(rate));
     csma.SetChannelAttribute("Delay",   StringValue(delay));
+    csma.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize("100p"))); // keep near qdisc cap
     return csma.Install(NodeContainer(a,b));
   }
 
