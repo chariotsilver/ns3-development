@@ -12,6 +12,7 @@
 #include "ns3/flow-monitor-module.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/rng-seed-manager.h"
+#include "ns3/type-id.h"
 #include <fstream>
 #include <sstream>
 #include <set>
@@ -30,6 +31,13 @@ NS_LOG_COMPONENT_DEFINE("SpProactiveController");
 // Global variables for error tracking and verbosity
 static std::atomic<uint32_t> g_dpctlErrors{0};
 static uint32_t g_verbosity = 1;  // Default verbosity level
+
+// Returns true if this build exposes the "Limit" attribute on PfifoFastQueueDisc
+static bool PfifoHasLimitAttr() {
+  ns3::TypeId tid = ns3::PfifoFastQueueDisc::GetTypeId();
+  ns3::TypeId::AttributeInformation info;
+  return tid.LookupAttributeByName("Limit", &info);
+}
 
 // ---- Proactive Shortest-Path Controller ----
 
@@ -227,8 +235,9 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
 static void PollQ(QueueDiscContainer qds, Time interval) {
   for (uint32_t i = 0; i < qds.GetN(); ++i) {
     auto qd = qds.Get(i);
-    std::cout << Simulator::Now().GetSeconds() << ",QSIZE_OBJ,"
-             << qd->GetCurrentSize().GetValue() << "\n";
+    std::cout << Simulator::Now().GetSeconds()
+              << ",QSIZE_OBJ," << qd->GetNPackets()
+              << ",BYTES=" << qd->GetNBytes() << "\n";
   }
   Simulator::Schedule(interval, &PollQ, qds, interval);
 }
@@ -512,7 +521,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     cmd.AddValue("qkdDur", "QKD window duration (s)", qkdDur);
     cmd.AddValue("qkdPps", "QKD packets per second", qkdPps);
     cmd.AddValue("beRate", "Best-effort data rate", beRate);
-    cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets)", qdiscMaxP);
+    cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets). Applied only if supported in this ns-3 build.", qdiscMaxP);
     cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
     cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
     cmd.AddValue("qdiscOnSwitch", "Install PfifoFast on switch ports too", qdiscOnSwitch);
@@ -712,7 +721,13 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
 
     // ---------------- QoS: ensure PfifoFast (priority-aware) on host NICs ----------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
+    if (PfifoHasLimitAttr()) {
+      tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc",
+                           "Limit", UintegerValue(qdiscMaxP));
+    } else {
+      tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
+      NS_LOG_INFO("PfifoFast has no 'Limit' attribute in this build; using defaults");
+    }
 
     QueueDiscContainer hostQdiscs;
 
@@ -744,6 +759,14 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
 
     // Optional: Install PfifoFast on switch ports for egress contention modeling
     if (qdiscOnSwitch) {
+      TrafficControlHelper swTch;
+      if (PfifoHasLimitAttr()) {
+        swTch.SetRootQueueDisc("ns3::PfifoFastQueueDisc",
+                               "Limit", UintegerValue(qdiscMaxP));
+      } else {
+        swTch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
+      }
+      
       for (const auto& kv : swPorts) {
         const auto& plist = kv.second;
         for (uint32_t i = 0; i < plist.GetN(); ++i) {
@@ -756,7 +779,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
           }
           
           // Install fresh PfifoFast on switch port
-          tch.Install(NetDeviceContainer(dev));
+          swTch.Install(NetDeviceContainer(dev));
         }
       }
       std::cout << "DEBUG: Installed PfifoFast on all switch ports for egress contention modeling" << std::endl;
