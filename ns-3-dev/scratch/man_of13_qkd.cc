@@ -7,6 +7,7 @@
 #include "ns3/traffic-control-module.h"
 #include "ns3/traffic-control-layer.h"
 #include "ns3/fq-codel-queue-disc.h"
+#include "ns3/pfifo-fast-queue-disc.h"
 #include "ns3/queue-size.h"
 #include "ns3/ofswitch13-module.h"
 #include "ns3/flow-monitor-module.h"
@@ -20,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
+#include <algorithm>
 
 using namespace ns3;
 
@@ -75,12 +77,17 @@ protected:
   }
 
 private:
+  // Safe dpctl wrapper for better error handling
+  void DpctlOrWarn(const char* where, uint64_t dpid, const std::string& cmd) {
+    int ret = DpctlExecute(dpid, cmd);
+    if (ret != 0) {
+      NS_LOG_WARN(where << ": dpctl command failed with return code " << ret << " for: " << cmd);
+    }
+  }
+
   void InstallTableMissDrop(uint64_t dpid) {
     // Install lowest priority rule to drop unmatched packets with explicit empty instruction list
-    int ret = DpctlExecute(dpid, "flow-mod cmd=add,table=0,prio=0 apply:");
-    if (ret != 0) {
-      NS_LOG_WARN("dpctl table-miss install failed with return code: " << ret);
-    }
+    DpctlOrWarn("table-miss", dpid, "flow-mod cmd=add,table=0,prio=0 apply:");
   }
 
   void PushFlowsForSwitch(uint64_t dpid) {
@@ -105,14 +112,14 @@ private:
       arpCmd << "flow-mod cmd=add,table=0,prio=200"
              << " eth_type=0x0806,arp_tpa=" << host.ip
              << " apply:output=" << outPort;
-      DpctlExecute(dpid, arpCmd.str());
+      DpctlOrWarn("ARP", dpid, arpCmd.str());
 
       // Install IPv4 rule
       std::ostringstream ipCmd;
       ipCmd << "flow-mod cmd=add,table=0,prio=100"
             << " eth_type=0x0800,eth_dst=" << host.mac
             << " apply:output=" << outPort;
-      DpctlExecute(dpid, ipCmd.str());
+      DpctlOrWarn("IPv4", dpid, ipCmd.str());
     }
   }
 
@@ -235,7 +242,7 @@ static void PollQ(QueueDiscContainer qds) {
     CsmaHelper csma;
     csma.SetChannelAttribute("DataRate", StringValue(rate));
     csma.SetChannelAttribute("Delay",   StringValue(delay));
-    csma.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", QueueSizeValue(QueueSize(std::to_string(txQueueMaxP) + "p"))); // configurable queue size
+    csma.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", StringValue(std::to_string(txQueueMaxP) + "p"));
     return csma.Install(NodeContainer(a,b));
   }
 
@@ -340,15 +347,23 @@ static void PollQ(QueueDiscContainer qds) {
   BuildNodeToDpid(const std::vector<Ptr<Node>>& swNodes) {
     std::unordered_map<uint32_t, Sw> m;
     for (auto swNode : swNodes) {
-      // Try to find OFSwitch13Device in the node's aggregated objects
-      Ptr<OFSwitch13Device> ofdev = swNode->GetObject<OFSwitch13Device>();
-      if (ofdev) {
-        Sw dpid = ofdev->GetDatapathId();
-        m[swNode->GetId()] = dpid;
-        std::cout << "DEBUG: Discovered NodeId " << swNode->GetId() << " -> DPID " << dpid << std::endl;
-      } else {
-        NS_ABORT_MSG_IF(true, "No OFSwitch13Device on node " << swNode->GetId());
+      Ptr<OFSwitch13Device> ofdev;
+      
+      // First try GetObject (aggregated objects) which is the most common case
+      ofdev = swNode->GetObject<OFSwitch13Device>();
+      
+      // If not found as aggregated object, search through all devices
+      if (!ofdev) {
+        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i) {
+          ofdev = DynamicCast<OFSwitch13Device>(swNode->GetDevice(i));
+          if (ofdev) break;
+        }
       }
+      
+      NS_ABORT_MSG_IF(!ofdev, "No OFSwitch13Device on node " << swNode->GetId());
+      const Sw dpid = ofdev->GetDatapathId();
+      m[swNode->GetId()] = dpid;
+      std::cout << "DEBUG: Discovered NodeId " << swNode->GetId() << " -> DPID " << dpid << std::endl;
     }
     return m;
   }
@@ -637,10 +652,10 @@ static void PollQ(QueueDiscContainer qds) {
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> fm = fmHelper.InstallAll();
 
-    // ---------------- QoS: ensure FQ-CoDel (bounded) on host NICs ----------------
+    // ---------------- QoS: ensure PfifoFast (priority-aware) on host NICs ----------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::FqCoDelQueueDisc",
-                         "MaxSize", QueueSizeValue(QueueSize(std::to_string(qdiscMaxP) + "p"))); // configurable qdisc size
+    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc",
+                         "MaxSize", QueueSizeValue(QueueSize(QueueSizeUnit::PACKETS, qdiscMaxP)));
 
     QueueDiscContainer hostQdiscs;
 
@@ -649,12 +664,11 @@ static void PollQ(QueueDiscContainer qds) {
       Ptr<TrafficControlLayer> tcl = dev->GetNode()->GetObject<TrafficControlLayer>();
       
       // Always delete existing qdisc to ensure fresh installation with correct parameters
-      Ptr<QueueDisc> existingQd = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr;
-      if (existingQd) {
+      if (Ptr<QueueDisc> existing = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr) {
         tcl->DeleteRootQueueDiscOnDevice(dev);
       }
       
-      // Install fresh FQ-CoDel with specified MaxSize
+      // Install fresh PfifoFast with specified Limit
       QueueDiscContainer c = tch.Install(NetDeviceContainer(dev));
       hostQdiscs.Add(c.Get(0));
     }
@@ -738,19 +752,19 @@ static void PollQ(QueueDiscContainer qds) {
     //                 /*pktSize*/ 400, /*pps*/ qkdPps);
     // }
 
-    // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst
-    uint16_t qctrlPort = 5555;
-    OnOffHelper qctrl("ns3::UdpSocketFactory",
-                      InetSocketAddress(ifs.GetAddress(qDst), qctrlPort));
-    qctrl.SetAttribute("DataRate", StringValue("64kbps"));   // tiny control rate
-    qctrl.SetAttribute("PacketSize", UintegerValue(200));
-    qctrl.SetAttribute("StartTime", TimeValue(Seconds(qkdStart)));
-    qctrl.SetAttribute("OnTime",  StringValue("ns3::ConstantRandomVariable[Constant=1e9]"));
-    qctrl.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-    (usingCsv ? qctrl.Install(hostByIndex[qSrc]) : qctrl.Install(man.host[qSrc]));
+    // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst with EF marking
+    Ptr<QkdWindowApp> qctrlApp = CreateObject<QkdWindowApp>();
+    ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(qctrlApp);
+
+    // 64 kbps @ 200B -> ~40 pps
+    qctrlApp->Configure( usingCsv ? hostByIndex[qSrc] : man.host[qSrc],
+                         ifs.GetAddress(qDst), 5555,
+                         Seconds(qkdStart),
+                         Seconds(3.0 - qkdStart),   // or a longer Stop() if you extend the sim
+                         200, 40.0 );
 
     PacketSinkHelper qctrlSink("ns3::UdpSocketFactory",
-                               InetSocketAddress(Ipv4Address::GetAny(), qctrlPort));
+                               InetSocketAddress(Ipv4Address::GetAny(), 5555));
     ApplicationContainer qctrlSinkApp = (usingCsv
       ? qctrlSink.Install(hostByIndex[qDst])
       : qctrlSink.Install(man.host[qDst]));
