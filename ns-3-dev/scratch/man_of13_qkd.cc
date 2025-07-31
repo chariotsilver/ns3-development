@@ -63,9 +63,6 @@ public:
   void SetAdjacency(const SwAdj& adj) { m_adj = adj; }
   void SetHosts(const std::vector<HostInfo>& hosts) { m_hosts = hosts; }
 
-  // Store switch nodes for DPID discovery
-  void SetSwitchNodes(const std::vector<Ptr<Node>>& swNodes) { m_switchNodes = swNodes; }
-
   // Flag to indicate if topology uses NodeId keys that need remapping
   void SetNeedsRemapping(bool needs) { m_needsRemapping = needs; }
 
@@ -75,116 +72,14 @@ protected:
     NS_LOG_INFO("SpProactiveController: Switch connected DPID=" << dpid);
     std::cout << "DEBUG: HandshakeSuccessful called for switch DPID " << dpid << std::endl;
     
-    // Store the DPID->node mapping for debugging
-    m_connectedSwitches.insert(dpid);
-    std::cout << "DEBUG: " << m_connectedSwitches.size() << " switches connected so far (expecting " << m_switchNodes.size() << ")" << std::endl;
-    
-    // If this is the last switch and we need remapping, perform NodeId->DPID conversion
-    bool justCompleteRemapping = false;
-    if (m_needsRemapping && m_connectedSwitches.size() == m_switchNodes.size()) {
-      std::cout << "DEBUG: All switches connected, starting topology remapping" << std::endl;
-      RemapTopologyToDpids();
-      justCompleteRemapping = true;
-    }
-    
-    // Install table-miss drop and flows for this switch immediately
     InstallTableMissDrop(dpid);
-    
-    // Only push flows after remapping is complete (or not needed)
-    if (!m_needsRemapping && !justCompleteRemapping) {
-      std::cout << "DEBUG: Pushing flows for DPID " << dpid << " (remapping not needed)" << std::endl;
-      PushFlowsForSwitch(dpid);
-    } else if (justCompleteRemapping) {
-      // After remapping, push flows for all connected switches
-      std::cout << "DEBUG: Pushing flows for all " << m_connectedSwitches.size() << " connected switches (after remapping)" << std::endl;
-      for (uint64_t connectedDpid : m_connectedSwitches) {
-        std::cout << "DEBUG: Pushing flows for DPID " << connectedDpid << std::endl;
-        PushFlowsForSwitch(connectedDpid);
-      }
-    } else {
-      std::cout << "DEBUG: Not pushing flows for DPID " << dpid << " yet (waiting for more switches)" << std::endl;
-    }
+    PushFlowsForSwitch(dpid);
   }
 
 private:
   void InstallTableMissDrop(uint64_t dpid) {
     // Install lowest priority rule to drop unmatched packets
     DpctlExecute(dpid, "flow-mod cmd=add,table=0,prio=0");
-  }
-
-  // Build real NodeId->DPID mapping from installed switches
-  std::unordered_map<uint32_t, Sw> BuildNodeToDpid(const std::vector<Ptr<Node>>& swNodes) {
-    std::unordered_map<uint32_t, Sw> m;
-    for (auto swNode : swNodes) {
-      std::cout << "DEBUG: Examining node " << swNode->GetId() << " with " << swNode->GetNDevices() << " devices" << std::endl;
-      
-      // Try to find OFSwitch13Device in the node's aggregated objects
-      Ptr<OFSwitch13Device> ofdev = swNode->GetObject<OFSwitch13Device>();
-      if (ofdev) {
-        Sw dpid = ofdev->GetDatapathId();
-        std::cout << "DEBUG: Found OFSwitch13Device via GetObject with DPID " << dpid << std::endl;
-        m[swNode->GetId()] = dpid;
-        std::cout << "DEBUG: Discovered NodeId " << swNode->GetId() << " -> DPID " << dpid << std::endl;
-      } else {
-        std::cout << "DEBUG: No OFSwitch13Device found via GetObject on node " << swNode->GetId() << std::endl;
-        // Fallback: check devices
-        Sw dpid = 0;
-        for (uint32_t i = 0; i < swNode->GetNDevices(); ++i) {
-          auto device = swNode->GetDevice(i);
-          std::cout << "DEBUG: Device " << i << " type: " << device->GetTypeId().GetName() << std::endl;
-          if (auto dev = DynamicCast<OFSwitch13Device>(device)) {
-            dpid = dev->GetDatapathId();
-            std::cout << "DEBUG: Found OFSwitch13Device in devices with DPID " << dpid << std::endl;
-            break;
-          }
-        }
-        NS_ABORT_MSG_IF(dpid == 0, "No OFSwitch13Device found on switch node " << swNode->GetId());
-        m[swNode->GetId()] = dpid;
-        std::cout << "DEBUG: Discovered NodeId " << swNode->GetId() << " -> DPID " << dpid << std::endl;
-      }
-    }
-    return m;
-  }
-
-  void RemapTopologyToDpids() {
-    std::cout << "DEBUG: Remapping topology from NodeId to DPID keys" << std::endl;
-    
-    // Build NodeId -> DPID map from switch nodes using BuildNodeToDpid
-    auto nodeToDpid = BuildNodeToDpid(m_switchNodes);
-    
-    // Remap adjacency from NodeId to DPID keys
-    SwAdj adjByDpid;
-    for (auto &kv : m_adj) {
-      auto nodeIdIt = nodeToDpid.find(kv.first);
-      if (nodeIdIt == nodeToDpid.end()) continue; // Skip if NodeId not found
-      
-      Sw srcDpid = nodeIdIt->second;
-      for (auto &pkv : kv.second) {
-        Port port = pkv.first;
-        auto peer = pkv.second;
-        PortPeer npeer = peer;
-        if (peer.isSwitch) {
-          auto peerNodeIdIt = nodeToDpid.find(peer.sw);
-          if (peerNodeIdIt != nodeToDpid.end()) {
-            npeer.sw = peerNodeIdIt->second; // convert NodeId -> DPID
-          }
-        }
-        adjByDpid[srcDpid][port] = npeer;
-      }
-    }
-    
-    // Remap hosts from NodeId to DPID keys
-    for (auto &h : m_hosts) {
-      auto nodeIdIt = nodeToDpid.find(static_cast<uint32_t>(h.edgeSw));
-      if (nodeIdIt != nodeToDpid.end()) {
-        h.edgeSw = nodeIdIt->second;
-      }
-    }
-    
-    // Update internal state
-    m_adj = adjByDpid;
-    m_needsRemapping = false;
-    std::cout << "DEBUG: Topology remapped to DPID keys" << std::endl;
   }
 
   void PushFlowsForSwitch(uint64_t dpid) {
@@ -273,8 +168,6 @@ private:
 private:
   SwAdj m_adj;
   std::vector<HostInfo> m_hosts;
-  std::vector<Ptr<Node>> m_switchNodes;
-  std::set<uint64_t> m_connectedSwitches;
   bool m_needsRemapping{false};
 };
 
@@ -437,6 +330,52 @@ static void PollQ(QueueDiscContainer qds) {
     }
     
     return m;
+  }
+
+  // Helper functions for DPID discovery and remapping (called from main)
+  static std::unordered_map<uint32_t, Sw>
+  BuildNodeToDpid(const std::vector<Ptr<Node>>& swNodes) {
+    std::unordered_map<uint32_t, Sw> m;
+    for (auto swNode : swNodes) {
+      // Try to find OFSwitch13Device in the node's aggregated objects
+      Ptr<OFSwitch13Device> ofdev = swNode->GetObject<OFSwitch13Device>();
+      if (ofdev) {
+        Sw dpid = ofdev->GetDatapathId();
+        m[swNode->GetId()] = dpid;
+        std::cout << "DEBUG: Discovered NodeId " << swNode->GetId() << " -> DPID " << dpid << std::endl;
+      } else {
+        NS_ABORT_MSG_IF(true, "No OFSwitch13Device on node " << swNode->GetId());
+      }
+    }
+    return m;
+  }
+
+  static void RemapToDpid(
+    const SwAdj& adjByNodeId, const std::vector<HostInfo>& hostsByNodeId,
+    const std::unordered_map<uint32_t, Sw>& nodeToDpid,
+    SwAdj& adjByDpid, std::vector<HostInfo>& hostsByDpid)
+  {
+    adjByDpid.clear(); 
+    hostsByDpid = hostsByNodeId;
+    
+    for (const auto& kv : adjByNodeId) {
+      Sw src = nodeToDpid.at(kv.first);
+      for (const auto& pkv : kv.second) {
+        Port p = pkv.first; 
+        auto peer = pkv.second; 
+        auto np = peer;
+        if (peer.isSwitch) {
+          np.sw = nodeToDpid.at((uint32_t)peer.sw);
+        }
+        adjByDpid[src][p] = np;
+      }
+    }
+    
+    for (auto& h : hostsByDpid) {
+      h.edgeSw = nodeToDpid.at((uint32_t)h.edgeSw);
+    }
+    
+    std::cout << "DEBUG: Remapped topology from NodeId to DPID keys" << std::endl;
   }
 
   // Generic adjacency and host builder that works for both built-in and CSV topologies
@@ -677,19 +616,21 @@ static void PollQ(QueueDiscContainer qds) {
     const std::vector<Edge>* csvSpursPtr = usingCsv ? &topo.spurEdges : nullptr;
     BuildAdjAndHosts_Generic(usingCsv, coreLinks, spurLinks, devToPortByNode, devToIp, csvSpursPtr, adj, hostTbl);
 
-    // Set topology on controller with remapping info (will discover DPIDs during handshake)
-    ctrl->SetAdjacency(adj);
-    ctrl->SetHosts(hostTbl);
-    ctrl->SetNeedsRemapping(true);
-    
-    // Store switch nodes for DPID discovery during handshake
-    std::vector<Ptr<Node>> swNodes;
-    if (usingCsv) swNodes = topo.sw; else swNodes = man.sw;
-    ctrl->SetSwitchNodes(swNodes);
-    
-    // (E) Only now open channels so HandshakeSuccessful() pushes flows with populated data
-    of13->CreateOpenFlowChannels();  // controller will push flows on handshake
-    std::cout << "DEBUG: Configured controller with " << adj.size() << " switches and " << hostTbl.size() << " hosts (NodeId keys, will remap to DPID)" << std::endl;
+    // Discover DPIDs and remap topology (devices already exist after InstallSwitch)
+    std::vector<Ptr<Node>> swNodes = usingCsv ? topo.sw : man.sw;
+    auto nodeToDpid = BuildNodeToDpid(swNodes);
+    SwAdj adjDpid; 
+    std::vector<HostInfo> hostsDpid;
+    RemapToDpid(adj, hostTbl, nodeToDpid, adjDpid, hostsDpid);
+
+    // Set DPID-keyed topology on controller (no remapping needed)
+    ctrl->SetAdjacency(adjDpid);
+    ctrl->SetHosts(hostsDpid);
+    ctrl->SetNeedsRemapping(false);  // (now a no-op, can be removed later)
+    std::cout << "DEBUG: Configured controller with " << adjDpid.size() << " switches and " << hostsDpid.size() << " hosts (DPID keys)" << std::endl;
+
+    // Now open channels; HandshakeSuccessful will push flows immediately
+    of13->CreateOpenFlowChannels();
     std::cout << "DEBUG: Created OpenFlow channels" << std::endl;
 
     // Install FlowMonitor for per-flow telemetry
