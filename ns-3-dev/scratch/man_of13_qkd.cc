@@ -231,15 +231,15 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
   class QkdWindowApp : public ns3::Application {
   public:
     void Configure(Ptr<Node> n, Ipv4Address dst, uint16_t dport,
-                  Time start, Time dur, uint32_t pktSize, double pps) {
+                  Time start, Time dur, uint32_t pktSize, double pps, uint8_t tos = 0xC0) {
       m_node=n; m_dst=dst; m_dport=dport; m_start=start; m_dur=dur;
-      m_pktSize=pktSize; m_interval=Seconds(1.0/pps);
+      m_pktSize=pktSize; m_interval=Seconds(1.0/pps); m_tos=tos;
     }
   private:
     void StartApplication() override {
       m_sock = Socket::CreateSocket(m_node, UdpSocketFactory::GetTypeId());
       m_sock->SetPriority(6);   // High priority band for reliable classification
-      m_sock->SetIpTos(0xC0);   // DSCP CS6 -> band 0 (highest priority)
+      m_sock->SetIpTos(m_tos);   // Configurable QoS marking (CS6 or EF)
       m_sock->Connect(InetSocketAddress(m_dst, m_dport));
       Simulator::Schedule(m_start, &QkdWindowApp::StartBurst, this);
       Simulator::Schedule(m_start + m_dur, &QkdWindowApp::StopBurst, this);
@@ -255,6 +255,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     Ptr<Node> m_node; Ptr<Socket> m_sock;
     Ipv4Address m_dst; uint16_t m_dport{5555};
     Time m_start, m_dur, m_interval; uint32_t m_pktSize{400}; bool m_on{false};
+    uint8_t m_tos{0xC0};  // Default to CS6
   };
 
   static NetDeviceContainer Link(Ptr<Node>a, Ptr<Node>b, std::string rate, std::string delay, uint32_t txQueueMaxP = 25)
@@ -488,7 +489,10 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     
     // Queue parameters
     uint32_t qdiscMaxP = 100, txQueueMaxP = 25;
-    uint32_t qdiscPollMs = 5; // reduce event load vs. 1ms
+    uint32_t qdiscPollMs = 20; // Higher default for scalability on larger topologies
+    
+    // QoS parameters
+    std::string qosMark = "CS6"; // or "EF"
     
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
@@ -505,11 +509,17 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets)", qdiscMaxP);
     cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
     cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
+    cmd.AddValue("qosMark", "QKD priority mark: EF or CS6", qosMark);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
     RngSeedManager::SetSeed(seed);
     RngSeedManager::SetRun(run);
+
+    // Map QoS marking to TOS value
+    uint8_t qosTos = (qosMark == "EF" ? 0xB8 : 0xC0); // EF=0xb8, CS6=0xc0
+    std::cout << "QKD control traffic using " << qosMark << " marking (TOS=0x" 
+              << std::hex << (uint32_t)qosTos << std::dec << ")" << std::endl;
 
     // Build topology
     TopoBuild topo;
@@ -787,7 +797,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     //                 /*pktSize*/ 400, /*pps*/ qkdPps);
     // }
 
-    // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst with EF marking
+    // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst with configurable marking
     Ptr<QkdWindowApp> qctrlApp = CreateObject<QkdWindowApp>();
     ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(qctrlApp);
 
@@ -796,7 +806,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
                          ifs.GetAddress(qDst), 5555,
                          Seconds(qkdStart),
                          Seconds(15.0 - qkdStart),   // Extended to match simulation duration
-                         200, 40.0 );
+                         200, 40.0, qosTos );
 
     PacketSinkHelper qctrlSink("ns3::UdpSocketFactory",
                                InetSocketAddress(Ipv4Address::GetAny(), 5555));
