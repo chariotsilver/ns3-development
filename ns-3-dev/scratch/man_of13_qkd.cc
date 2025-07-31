@@ -716,7 +716,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
 
     // ---------------- QoS: ensure PfifoFast (priority-aware) on host NICs ----------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc", "MaxSize", QueueSizeValue(QueueSize(QueueSizeUnit::PACKETS, qdiscMaxP)));
+    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
 
     QueueDiscContainer hostQdiscs;
 
