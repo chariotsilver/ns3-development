@@ -298,6 +298,12 @@ static void PollQ(QueueDiscContainer qds) {
       std::string u,v,kind,rate,delay;
       std::getline(ss,u,','); std::getline(ss,v,',');
       std::getline(ss,kind,','); std::getline(ss,rate,','); std::getline(ss,delay,',');
+      
+      // Validate edge kind
+      if (kind != "core" && kind != "spur") {
+        NS_FATAL_ERROR("Unknown CSV kind='" << kind << "' on edge " << u << "," << v);
+      }
+      
       Ptr<Node> nu = getNode(u), nv = getNode(v);
       auto devs = Link(nu, nv, rate, delay, 25);  // Keep all CSMA for OFSwitch13 compatibility, use default txQueueMaxP for CSV links
       Edge e; e.a=nu; e.b=nv; e.devs=devs; e.kind=kind;
@@ -532,6 +538,14 @@ static void PollQ(QueueDiscContainer qds) {
       std::sort(hostNicByIndex.begin(), hostNicByIndex.end(),
                 [](const auto& a, const auto& b){ return a.first < b.first; });
       
+      // Detect host multi-homing (not supported)
+      std::unordered_set<uint32_t> seen;
+      for (const auto& kv : hostNicByIndex) {
+        if (!seen.insert(kv.first).second) {
+          NS_FATAL_ERROR("Host h" << kv.first << " appears on multiple spur edges; multi-homing not supported.");
+        }
+      }
+      
       for (const auto& [idx, dev] : hostNicByIndex) {
         hostDevs.Add(dev);
         hostByIndex.push_back(dev->GetNode());   // node order aligned to IPs
@@ -760,7 +774,7 @@ static void PollQ(QueueDiscContainer qds) {
     qctrlApp->Configure( usingCsv ? hostByIndex[qSrc] : man.host[qSrc],
                          ifs.GetAddress(qDst), 5555,
                          Seconds(qkdStart),
-                         Seconds(3.0 - qkdStart),   // or a longer Stop() if you extend the sim
+                         Seconds(15.0 - qkdStart),   // Extended to match simulation duration
                          200, 40.0 );
 
     PacketSinkHelper qctrlSink("ns3::UdpSocketFactory",
@@ -769,12 +783,22 @@ static void PollQ(QueueDiscContainer qds) {
       ? qctrlSink.Install(hostByIndex[qDst])
       : qctrlSink.Install(man.host[qDst]));
 
-    Simulator::Stop(Seconds(3.0));
+    Simulator::Stop(Seconds(15.0));
     Simulator::Run();
     
     // FlowMonitor telemetry output
     fm->CheckForLostPackets();
     fm->SerializeToXmlFile("flows.xml", true, true);
+    
+    // Quick FlowMonitor summary
+    for (const auto& kv : fm->GetFlowStats()) {
+      const auto& s = kv.second;
+      double dur = (s.timeLastRxPacket - s.timeFirstTxPacket).GetSeconds();
+      double thr = dur > 0 ? (s.rxBytes * 8.0) / dur : 0.0;
+      std::cout << "Flow " << kv.first << ": rxBytes=" << s.rxBytes
+                << " thr=" << thr << " bps"
+                << " lost=" << s.lostPackets << "\n";
+    }
     
     // Results
     uint64_t totalBeRx = 0;
