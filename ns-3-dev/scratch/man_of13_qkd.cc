@@ -63,14 +63,12 @@ public:
   void SetAdjacency(const SwAdj& adj) { m_adj = adj; }
   void SetHosts(const std::vector<HostInfo>& hosts) { m_hosts = hosts; }
 
-  // Flag to indicate if topology uses NodeId keys that need remapping
-  void SetNeedsRemapping(bool needs) { m_needsRemapping = needs; }
+  // (no-op: remapping done in main now)
 
 protected:
   virtual void HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) override {
     uint64_t dpid = swtch->GetDpId();
-    NS_LOG_INFO("SpProactiveController: Switch connected DPID=" << dpid);
-    std::cout << "DEBUG: HandshakeSuccessful called for switch DPID " << dpid << std::endl;
+    NS_LOG_INFO("SpProactiveController: switch connected DPID=" << dpid);
     
     InstallTableMissDrop(dpid);
     PushFlowsForSwitch(dpid);
@@ -83,29 +81,27 @@ private:
   }
 
   void PushFlowsForSwitch(uint64_t dpid) {
-    std::cout << "DEBUG: PushFlowsForSwitch called for DPID " << dpid << std::endl;
-    std::cout << "DEBUG: Host table has " << m_hosts.size() << " entries" << std::endl;
+    NS_LOG_DEBUG("push flows for DPID=" << dpid << " (hosts=" << m_hosts.size() << ")");
     
     // Install ARP and IPv4 rules for all hosts that can reach this switch
     for (const auto& host : m_hosts) {
       Port outPort;
       if (dpid == host.edgeSw) {
         outPort = host.edgePort; // Direct delivery to host
-        std::cout << "DEBUG: Host " << host.ip << " is directly connected to DPID " << dpid << " on port " << outPort << std::endl;
+        NS_LOG_DEBUG("host " << host.ip << " directly on " << dpid << " port " << outPort);
       } else {
         if (!NextHopPort(dpid, host.edgeSw, outPort)) {
-          std::cout << "DEBUG: No path from DPID " << dpid << " to host " << host.ip << " (edgeSw=" << host.edgeSw << ")" << std::endl;
+          NS_LOG_WARN("no path from DPID " << dpid << " to host " << host.ip
+                     << " (edgeSw=" << host.edgeSw << ")");
           continue;
         }
-        std::cout << "DEBUG: Host " << host.ip << " reachable from DPID " << dpid << " via port " << outPort << std::endl;
+        NS_LOG_DEBUG("host " << host.ip << " via DPID " << dpid << " out port " << outPort);
       }
       
-      // Install ARP rule (higher priority)
       std::ostringstream arpCmd;
       arpCmd << "flow-mod cmd=add,table=0,prio=200"
              << " eth_type=0x0806,arp_tpa=" << host.ip
              << " apply:output=" << outPort;
-      std::cout << "DEBUG: Installing ARP rule: " << arpCmd.str() << std::endl;
       DpctlExecute(dpid, arpCmd.str());
 
       // Install IPv4 rule
@@ -113,7 +109,6 @@ private:
       ipCmd << "flow-mod cmd=add,table=0,prio=100"
             << " eth_type=0x0800,eth_dst=" << host.mac
             << " apply:output=" << outPort;
-      std::cout << "DEBUG: Installing IPv4 rule: " << ipCmd.str() << std::endl;
       DpctlExecute(dpid, ipCmd.str());
     }
   }
@@ -162,13 +157,18 @@ private:
         }
       }
     }
+    // No path found: warn once per (src,dst)
+    auto key = std::make_pair(src, dst);
+    if (m_warnedNoPath.insert(key).second) {
+      NS_LOG_WARN("NextHopPort: no path from " << src << " to " << dst);
+    }
     return false;
   }
 
 private:
   SwAdj m_adj;
   std::vector<HostInfo> m_hosts;
-  bool m_needsRemapping{false};
+  std::set<std::pair<Sw,Sw>> m_warnedNoPath;
 };
 
 // Telemetry callbacks for queue monitoring
@@ -385,7 +385,6 @@ static void PollQ(QueueDiscContainer qds) {
     const std::vector< NetDeviceContainer >& spurLinks,
     const std::unordered_map<Ptr<NetDevice>, std::pair<uint32_t, Port>>& devToPortByNode,
     const std::unordered_map<Ptr<NetDevice>, Ipv4Address>& devToIp,
-    const std::vector<Edge>* csvSpurs,  // pass &topo.spurEdges if CSV, else nullptr
     SwAdj& adj,
     std::vector<HostInfo>& hosts)
   {
@@ -613,8 +612,7 @@ static void PollQ(QueueDiscContainer qds) {
     // (D) Build dev/port maps + adjacency + hosts (with NodeId keys initially)
     SwAdj adj; 
     std::vector<HostInfo> hostTbl;
-    const std::vector<Edge>* csvSpursPtr = usingCsv ? &topo.spurEdges : nullptr;
-    BuildAdjAndHosts_Generic(usingCsv, coreLinks, spurLinks, devToPortByNode, devToIp, csvSpursPtr, adj, hostTbl);
+    BuildAdjAndHosts_Generic(usingCsv, coreLinks, spurLinks, devToPortByNode, devToIp, adj, hostTbl);
 
     // Discover DPIDs and remap topology (devices already exist after InstallSwitch)
     std::vector<Ptr<Node>> swNodes = usingCsv ? topo.sw : man.sw;
@@ -626,7 +624,6 @@ static void PollQ(QueueDiscContainer qds) {
     // Set DPID-keyed topology on controller (no remapping needed)
     ctrl->SetAdjacency(adjDpid);
     ctrl->SetHosts(hostsDpid);
-    ctrl->SetNeedsRemapping(false);  // (now a no-op, can be removed later)
     std::cout << "DEBUG: Configured controller with " << adjDpid.size() << " switches and " << hostsDpid.size() << " hosts (DPID keys)" << std::endl;
 
     // Now open channels; HandshakeSuccessful will push flows immediately
