@@ -78,11 +78,12 @@ protected:
 
 private:
   // helpers
+  static std::atomic<uint32_t> g_dpctlErrors{0};
+  
   static bool DpctlFailed(int rc) { return rc != 0; }
   static bool DpctlFailed(const std::string& s) {
-    return s.find("error") != std::string::npos ||
-           s.find("invalid") != std::string::npos ||
-           s.find("Error") != std::string::npos;
+    auto has = [&](const char* k){ return s.find(k) != std::string::npos; };
+    return has("error") || has("Error") || has("invalid") || has("failed");
   }
   static std::string DpctlToString(int rc) { return std::to_string(rc); }
   static std::string DpctlToString(const std::string& s) { return s; }
@@ -91,6 +92,7 @@ private:
   void DpctlOrWarn(const char* where, uint64_t dpid, const std::string& cmd) {
     auto out = DpctlExecute(dpid, cmd); // int OR std::string
     if (DpctlFailed(out)) {
+      ++g_dpctlErrors;
       NS_LOG_WARN(where << ": dpctl problem dpid=" << std::hex << dpid
                         << " cmd='" << cmd << "' -> " << DpctlToString(out));
     } else {
@@ -613,6 +615,11 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
           if (e.a == swNode) ports.Add(e.devs.Get(0));
           if (e.b == swNode) ports.Add(e.devs.Get(1));
         }
+        
+        // CSV guardrail: ensure each switch has ≥1 port
+        NS_ABORT_MSG_IF(ports.GetN() == 0,
+          "CSV switch nodeId=" << swNode->GetId() << " has no attached ports");
+        
         of13->InstallSwitch(swNode, ports);
         
         // Record nodeId -> ports mapping (using nodeId as temporary key)
@@ -829,6 +836,17 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     ApplicationContainer qctrlSinkApp = (usingCsv
       ? qctrlSink.Install(hostByIndex[qDst])
       : qctrlSink.Install(man.host[qDst]));
+
+    // Schedule error summary for simulation teardown
+    if (g_verbosity >= 1) {
+      Simulator::ScheduleDestroy([]{
+        if (g_dpctlErrors > 0) {
+          NS_LOG_ERROR("TEARDOWN: " << g_dpctlErrors << " dpctl errors occurred during simulation");
+        } else {
+          NS_LOG_INFO("TEARDOWN: No dpctl errors detected");
+        }
+      });
+    }
 
     Simulator::Stop(Seconds(15.0));
     Simulator::Run();
