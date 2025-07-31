@@ -6,7 +6,6 @@
 #include "ns3/internet-apps-module.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/traffic-control-layer.h"
-#include "ns3/fq-codel-queue-disc.h"
 #include "ns3/pfifo-fast-queue-disc.h"
 #include "ns3/queue-size.h"
 #include "ns3/ofswitch13-module.h"
@@ -79,9 +78,13 @@ protected:
 private:
   // Safe dpctl wrapper for better error handling
   void DpctlOrWarn(const char* where, uint64_t dpid, const std::string& cmd) {
-    int ret = DpctlExecute(dpid, cmd);
-    if (ret != 0) {
-      NS_LOG_WARN(where << ": dpctl command failed with return code " << ret << " for: " << cmd);
+    int rc = DpctlExecute(dpid, cmd);
+    if (rc != 0) {
+      NS_LOG_WARN(where << ": dpctl rc=" << rc << " dpid=" << std::hex << dpid
+                       << " cmd='" << cmd << "'");
+    } else {
+      NS_LOG_DEBUG(where << ": dpctl ok dpid=" << std::hex << dpid
+                        << " cmd='" << cmd << "'");
     }
   }
 
@@ -120,6 +123,12 @@ private:
             << " eth_type=0x0800,eth_dst=" << host.mac
             << " apply:output=" << outPort;
       DpctlOrWarn("IPv4", dpid, ipCmd.str());
+
+      // One-time next-hop log per (switch, host-IP)
+      if (m_loggedNextHop.emplace(dpid, host.ip.Get()).second) {
+        NS_LOG_INFO("NextHop: sw=" << std::hex << dpid << " -> " << host.ip
+                     << " via port " << std::dec << outPort);
+      }
     }
   }
 
@@ -179,6 +188,7 @@ private:
   SwAdj m_adj;
   std::vector<HostInfo> m_hosts;
   std::set<std::pair<Sw,Sw>> m_warnedNoPath;
+  std::set<std::pair<Sw,uint32_t>> m_loggedNextHop;
 };
 
 // Telemetry callbacks for queue monitoring
@@ -198,14 +208,14 @@ static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
   std::cout << Simulator::Now().GetSeconds() << ",DROP," << tag << ",1\n";
 }
 
-static void PollQ(QueueDiscContainer qds) {
+static void PollQ(QueueDiscContainer qds, Time interval) {
   for (uint32_t i = 0; i < qds.GetN(); ++i) {
     auto qd = qds.Get(i);
     std::cout << Simulator::Now().GetSeconds() << ",QSIZE_OBJ,"
              << qd->GetCurrentSize().GetValue()
              << ",MAX=" << qd->GetMaxSize().GetValue() << "\n";
   }
-  Simulator::Schedule(MilliSeconds(1), &PollQ, qds);
+  Simulator::Schedule(interval, &PollQ, qds, interval);
 }
 
   class QkdWindowApp : public ns3::Application {
@@ -219,7 +229,7 @@ static void PollQ(QueueDiscContainer qds) {
     void StartApplication() override {
       m_sock = Socket::CreateSocket(m_node, UdpSocketFactory::GetTypeId());
       m_sock->SetPriority(6);   // High priority band for reliable classification
-      m_sock->SetIpTos(0xb8);   // DSCP EF (complementary)
+      m_sock->SetIpTos(0xC0);   // DSCP CS6 -> band 0 (highest priority)
       m_sock->Connect(InetSocketAddress(m_dst, m_dport));
       Simulator::Schedule(m_start, &QkdWindowApp::StartBurst, this);
       Simulator::Schedule(m_start + m_dur, &QkdWindowApp::StopBurst, this);
@@ -468,6 +478,7 @@ static void PollQ(QueueDiscContainer qds) {
     
     // Queue parameters
     uint32_t qdiscMaxP = 100, txQueueMaxP = 25;
+    uint32_t qdiscPollMs = 5; // reduce event load vs. 1ms
     
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
@@ -481,8 +492,9 @@ static void PollQ(QueueDiscContainer qds) {
     cmd.AddValue("qkdDur", "QKD window duration (s)", qkdDur);
     cmd.AddValue("qkdPps", "QKD packets per second", qkdPps);
     cmd.AddValue("beRate", "Best-effort data rate", beRate);
-    cmd.AddValue("qdiscMaxP", "FQ-CoDel MaxSize in packets", qdiscMaxP);
+    cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets)", qdiscMaxP);
     cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
+    cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -668,8 +680,7 @@ static void PollQ(QueueDiscContainer qds) {
 
     // ---------------- QoS: ensure PfifoFast (priority-aware) on host NICs ----------------
     TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc",
-                         "MaxSize", QueueSizeValue(QueueSize(QueueSizeUnit::PACKETS, qdiscMaxP)));
+    tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc", "MaxSize", QueueSizeValue(QueueSize(QueueSizeUnit::PACKETS, qdiscMaxP)));
 
     QueueDiscContainer hostQdiscs;
 
@@ -697,7 +708,7 @@ static void PollQ(QueueDiscContainer qds) {
     }
 
     // Object-based queue size polling for verification
-    Simulator::Schedule(Seconds(0.4), &PollQ, hostQdiscs);
+    Simulator::Schedule(Seconds(0.4), &PollQ, hostQdiscs, MilliSeconds(qdiscPollMs));
 
     // Best-effort background traffic (deterministic pairing)
     uint16_t bePort = 9000;
@@ -793,8 +804,13 @@ static void PollQ(QueueDiscContainer qds) {
     // Quick FlowMonitor summary
     for (const auto& kv : fm->GetFlowStats()) {
       const auto& s = kv.second;
-      double dur = (s.timeLastRxPacket - s.timeFirstTxPacket).GetSeconds();
-      double thr = dur > 0 ? (s.rxBytes * 8.0) / dur : 0.0;
+      double dur = 0.0;
+      if (s.rxPackets > 1) {
+        dur = (s.timeLastRxPacket - s.timeFirstRxPacket).GetSeconds();
+      } else {
+        dur = (s.timeLastRxPacket - s.timeFirstTxPacket).GetSeconds();
+      }
+      double thr = dur > 1e-9 ? (s.rxBytes * 8.0) / dur : 0.0;
       std::cout << "Flow " << kv.first << ": rxBytes=" << s.rxBytes
                 << " thr=" << thr << " bps"
                 << " lost=" << s.lostPackets << "\n";
