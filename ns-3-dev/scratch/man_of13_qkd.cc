@@ -46,7 +46,7 @@ struct PortPeer {
 };
 
 // Switch adjacency: on switch S, port p leads to either another switch or a host
-using PortMap = std::unordered_map<Port, PortPeer>;
+using PortMap = std::map<Port, PortPeer>;
 using SwAdj   = std::unordered_map<Sw, PortMap>;
 
 class SpProactiveController : public OFSwitch13Controller {
@@ -76,8 +76,11 @@ protected:
 
 private:
   void InstallTableMissDrop(uint64_t dpid) {
-    // Install lowest priority rule to drop unmatched packets
-    DpctlExecute(dpid, "flow-mod cmd=add,table=0,prio=0");
+    // Install lowest priority rule to drop unmatched packets with explicit empty instruction list
+    int ret = DpctlExecute(dpid, "flow-mod cmd=add,table=0,prio=0 apply:");
+    if (ret != 0) {
+      NS_LOG_WARN("dpctl table-miss install failed with return code: " << ret);
+    }
   }
 
   void PushFlowsForSwitch(uint64_t dpid) {
@@ -383,8 +386,8 @@ static void PollQ(QueueDiscContainer qds) {
     bool usingCsv,
     const std::vector< NetDeviceContainer >& coreLinks,
     const std::vector< NetDeviceContainer >& spurLinks,
-    const std::unordered_map<Ptr<NetDevice>, std::pair<uint32_t, Port>>& devToPortByNode,
-    const std::unordered_map<Ptr<NetDevice>, Ipv4Address>& devToIp,
+    const std::map<Ptr<NetDevice>, std::pair<uint32_t, Port>>& devToPortByNode,
+    const std::map<Ptr<NetDevice>, Ipv4Address>& devToIp,
     SwAdj& adj,
     std::vector<HostInfo>& hosts)
   {
@@ -491,8 +494,8 @@ static void PollQ(QueueDiscContainer qds) {
 
     // Map to track device -> (switch nodeId, port) for robust adjacency building
     std::unordered_map<Sw, NetDeviceContainer> swPorts; // nodeId -> ports (in exact order passed)
-    std::unordered_map<Ptr<NetDevice>, std::pair<uint32_t /*nodeId*/, Port>> devToPortByNode;
-    std::unordered_map<Ptr<NetDevice>, Ipv4Address> devToIp;
+    std::map<Ptr<NetDevice>, std::pair<uint32_t /*nodeId*/, Port>> devToPortByNode;
+    std::map<Ptr<NetDevice>, Ipv4Address> devToIp;
 
     if (usingCsv) {
       // Build stable host index mapping for proper IP assignment
