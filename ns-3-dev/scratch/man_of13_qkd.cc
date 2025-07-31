@@ -21,10 +21,15 @@
 #include <unordered_set>
 #include <queue>
 #include <algorithm>
+#include <atomic>
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("SpProactiveController");
+
+// Global variables for error tracking and verbosity
+static std::atomic<uint32_t> g_dpctlErrors{0};
+static uint32_t g_verbosity = 1;  // Default verbosity level
 
 // ---- Proactive Shortest-Path Controller ----
 
@@ -63,7 +68,6 @@ public:
   // Inject topology and hosts before StartApplication()
   void SetAdjacency(const SwAdj& adj) { m_adj = adj; }
   void SetHosts(const std::vector<HostInfo>& hosts) { m_hosts = hosts; }
-  void SetTimeouts(uint32_t idle, uint32_t hard) { m_idleTimeout = idle; m_hardTimeout = hard; }
 
   // (no-op: remapping done in main now)
 
@@ -78,8 +82,6 @@ protected:
 
 private:
   // helpers
-  static std::atomic<uint32_t> g_dpctlErrors{0};
-  
   static bool DpctlFailed(int rc) { return rc != 0; }
   static bool DpctlFailed(const std::string& s) {
     auto has = [&](const char* k){ return s.find(k) != std::string::npos; };
@@ -124,21 +126,17 @@ private:
         NS_LOG_DEBUG("host " << host.ip << " via DPID " << dpid << " out port " << outPort);
       }
       
-      // Build flow rule with optional timeouts
-      // Note: timeout syntax may vary by OpenFlow implementation
+      // Install ARP rule
       std::ostringstream arpCmd;
-      arpCmd << "flow-mod cmd=add,table=0,prio=200";
-      // Timeouts would be added here if supported by this NS3/OpenFlow version
-      // Current implementation: basic flows without aging for maximum compatibility
-      arpCmd << " eth_type=0x0806,arp_tpa=" << host.ip
+      arpCmd << "flow-mod cmd=add,table=0,prio=200"
+             << " eth_type=0x0806,arp_tpa=" << host.ip
              << " apply:output=" << outPort;
       DpctlOrWarn("ARP", dpid, arpCmd.str());
 
       // Install IPv4 rule
       std::ostringstream ipCmd;
-      ipCmd << "flow-mod cmd=add,table=0,prio=100";
-      // Timeouts would be added here if supported by this NS3/OpenFlow version  
-      ipCmd << " eth_type=0x0800,eth_dst=" << host.mac
+      ipCmd << "flow-mod cmd=add,table=0,prio=100"
+            << " eth_type=0x0800,eth_dst=" << host.mac
             << " apply:output=" << outPort;
       DpctlOrWarn("IPv4", dpid, ipCmd.str());
 
@@ -207,7 +205,6 @@ private:
   std::vector<HostInfo> m_hosts;
   std::set<std::pair<Sw,Sw>> m_warnedNoPath;
   std::set<std::pair<Sw,uint32_t>> m_loggedNextHop;
-  uint32_t m_idleTimeout{0}, m_hardTimeout{0};
 };
 
 // Telemetry callbacks for queue monitoring
@@ -231,8 +228,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
   for (uint32_t i = 0; i < qds.GetN(); ++i) {
     auto qd = qds.Get(i);
     std::cout << Simulator::Now().GetSeconds() << ",QSIZE_OBJ,"
-             << qd->GetCurrentSize().GetValue()
-             << ",MAX=" << qd->GetMaxSize().GetValue() << "\n";
+             << qd->GetCurrentSize().GetValue() << "\n";
   }
   Simulator::Schedule(interval, &PollQ, qds, interval);
 }
@@ -499,12 +495,10 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Queue parameters
     uint32_t qdiscMaxP = 100, txQueueMaxP = 25;
     uint32_t qdiscPollMs = 20; // Higher default for scalability on larger topologies
+    bool qdiscOnSwitch = false; // Switch-egress contention modeling
     
     // QoS parameters
     std::string qosMark = "CS6"; // or "EF"
-    
-    // Flow aging parameters
-    uint32_t idleTimeout = 0, hardTimeout = 0;
     
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
@@ -521,9 +515,8 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets)", qdiscMaxP);
     cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
     cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
+    cmd.AddValue("qdiscOnSwitch", "Install PfifoFast on switch ports too", qdiscOnSwitch);
     cmd.AddValue("qosMark", "QKD priority mark: EF or CS6", qosMark);
-    cmd.AddValue("idleTimeout", "Flow idle timeout (s, 0=none)", idleTimeout);
-    cmd.AddValue("hardTimeout", "Flow hard timeout (s, 0=none)", hardTimeout);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -707,11 +700,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Set DPID-keyed topology on controller (no remapping needed)
     ctrl->SetAdjacency(adjDpid);
     ctrl->SetHosts(hostsDpid);
-    ctrl->SetTimeouts(idleTimeout, hardTimeout);
     std::cout << "DEBUG: Configured controller with " << adjDpid.size() << " switches and " << hostsDpid.size() << " hosts (DPID keys)" << std::endl;
-    if (idleTimeout > 0 || hardTimeout > 0) {
-      std::cout << "DEBUG: Flow aging parameters set (idle:" << idleTimeout << "s hard:" << hardTimeout << "s) - ready for compatible OpenFlow implementations" << std::endl;
-    }
 
     // Now open channels; HandshakeSuccessful will push flows immediately
     of13->CreateOpenFlowChannels();
@@ -752,6 +741,26 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
 
     // Object-based queue size polling for verification
     Simulator::Schedule(Seconds(0.4), &PollQ, hostQdiscs, MilliSeconds(qdiscPollMs));
+
+    // Optional: Install PfifoFast on switch ports for egress contention modeling
+    if (qdiscOnSwitch) {
+      for (const auto& kv : swPorts) {
+        const auto& plist = kv.second;
+        for (uint32_t i = 0; i < plist.GetN(); ++i) {
+          Ptr<NetDevice> dev = plist.Get(i);
+          Ptr<TrafficControlLayer> tcl = dev->GetNode()->GetObject<TrafficControlLayer>();
+          
+          // Always delete existing qdisc to ensure fresh installation
+          if (Ptr<QueueDisc> existing = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr) {
+            tcl->DeleteRootQueueDiscOnDevice(dev);
+          }
+          
+          // Install fresh PfifoFast on switch port
+          tch.Install(NetDeviceContainer(dev));
+        }
+      }
+      std::cout << "DEBUG: Installed PfifoFast on all switch ports for egress contention modeling" << std::endl;
+    }
 
     // Best-effort background traffic (deterministic pairing)
     uint16_t bePort = 9000;
