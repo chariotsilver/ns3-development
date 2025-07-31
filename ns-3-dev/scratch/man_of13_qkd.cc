@@ -76,15 +76,25 @@ protected:
   }
 
 private:
+  // helpers
+  static bool DpctlFailed(int rc) { return rc != 0; }
+  static bool DpctlFailed(const std::string& s) {
+    return s.find("error") != std::string::npos ||
+           s.find("invalid") != std::string::npos ||
+           s.find("Error") != std::string::npos;
+  }
+  static std::string DpctlToString(int rc) { return std::to_string(rc); }
+  static std::string DpctlToString(const std::string& s) { return s; }
+
   // Safe dpctl wrapper for better error handling
   void DpctlOrWarn(const char* where, uint64_t dpid, const std::string& cmd) {
-    int rc = DpctlExecute(dpid, cmd);
-    if (rc != 0) {
-      NS_LOG_WARN(where << ": dpctl rc=" << rc << " dpid=" << std::hex << dpid
-                       << " cmd='" << cmd << "'");
+    auto out = DpctlExecute(dpid, cmd); // int OR std::string
+    if (DpctlFailed(out)) {
+      NS_LOG_WARN(where << ": dpctl problem dpid=" << std::hex << dpid
+                        << " cmd='" << cmd << "' -> " << DpctlToString(out));
     } else {
       NS_LOG_DEBUG(where << ": dpctl ok dpid=" << std::hex << dpid
-                        << " cmd='" << cmd << "'");
+                         << " cmd='" << cmd << "'");
     }
   }
 
@@ -281,7 +291,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
   static bool IsSwitchName(const std::string& n){ return !n.empty() && n[0]=='s'; }
   static bool IsHostName  (const std::string& n){ return !n.empty() && n[0]=='h'; }
 
-  TopoBuild BuildFromCsv(const std::string& path)
+  TopoBuild BuildFromCsv(const std::string& path, uint32_t txQueueMaxP)
   {
     TopoBuild tb;
 
@@ -315,7 +325,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
       }
       
       Ptr<Node> nu = getNode(u), nv = getNode(v);
-      auto devs = Link(nu, nv, rate, delay, 25);  // Keep all CSMA for OFSwitch13 compatibility, use default txQueueMaxP for CSV links
+      auto devs = Link(nu, nv, rate, delay, txQueueMaxP);
       Edge e; e.a=nu; e.b=nv; e.devs=devs; e.kind=kind;
       e.nameA = u; e.nameB = v;  // Track node names for robust device selection
       if (kind=="core") tb.coreEdges.push_back(e); else tb.spurEdges.push_back(e);
@@ -507,7 +517,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     Man man;
 
     if (usingCsv) {
-      topo = BuildFromCsv(topoPath);
+      topo = BuildFromCsv(topoPath, txQueueMaxP);
     } else {
       man = BuildMan(nCore, "10Gbps", "0.5ms", "1Gbps", "0.2ms", enableRing, txQueueMaxP);
     }
