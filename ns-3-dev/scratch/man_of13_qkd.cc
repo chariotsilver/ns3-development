@@ -26,6 +26,40 @@
 
 using namespace ns3;
 
+// Control plane metrics tracking
+struct ControlPlaneMetrics {
+  static inline Time firstSwitchTime = Time(0);
+  static inline uint32_t batchesProcessed = 0;
+  static inline uint32_t flowsInstalled = 0;
+  static inline Time lastFlowTime = Time(0);
+  
+  static void RecordFirstSwitch() {
+    if (firstSwitchTime == Time(0)) {
+      firstSwitchTime = Simulator::Now();
+    }
+  }
+  
+  static void RecordBatch() {
+    batchesProcessed++;
+  }
+  
+  static void RecordFlowInstall() {
+    flowsInstalled++;
+    lastFlowTime = Simulator::Now();
+  }
+  
+  static void PrintSummary() {
+    Time convergenceTime = lastFlowTime - firstSwitchTime;
+    std::cout << "\n--- Control Plane Metrics ---" << std::endl;
+    std::cout << "First switch connected: " << firstSwitchTime.GetSeconds() << "s" << std::endl;
+    std::cout << "Last flow installed: " << lastFlowTime.GetSeconds() << "s" << std::endl;
+    std::cout << "Convergence time: " << convergenceTime.GetMilliSeconds() << "ms" << std::endl;
+    std::cout << "Total batches: " << batchesProcessed << std::endl;
+    std::cout << "Total flows: " << flowsInstalled << std::endl;
+    std::cout << "----------------------------\n" << std::endl;
+  }
+};
+
 NS_LOG_COMPONENT_DEFINE("SpProactiveController");
 
 // Global variables for error tracking and verbosity
@@ -88,8 +122,8 @@ protected:
     PushFlowsForSwitch(dpid);
   }
 
-private:
-  // helpers
+protected:
+  // helpers - moved to protected for subclass access
   static bool DpctlFailed(int rc) { return rc != 0; }
   static bool DpctlFailed(const std::string& s) {
     auto has = [&](const char* k){ return s.find(k) != std::string::npos; };
@@ -98,6 +132,7 @@ private:
   static std::string DpctlToString(int rc) { return std::to_string(rc); }
   static std::string DpctlToString(const std::string& s) { return s; }
 
+private:
   // Safe dpctl wrapper for better error handling
   void DpctlOrWarn(const char* where, uint64_t dpid, const std::string& cmd) {
     auto out = DpctlExecute(dpid, cmd); // int OR std::string
@@ -111,6 +146,7 @@ private:
     }
   }
 
+protected:
   void InstallTableMissDrop(uint64_t dpid) {
     // Install lowest priority rule to drop unmatched packets with explicit empty instruction list
     DpctlOrWarn("table-miss", dpid, "flow-mod cmd=add,table=0,prio=0 apply:");
@@ -208,11 +244,130 @@ private:
     return false;
   }
 
-private:
+protected:
   SwAdj m_adj;
   std::vector<HostInfo> m_hosts;
+
+private:
   std::set<std::pair<Sw,Sw>> m_warnedNoPath;
   std::set<std::pair<Sw,uint32_t>> m_loggedNextHop;
+};
+
+// ---- Realistic Controller with Control-Plane Latency Emulation ----
+
+class RealisticController : public SpProactiveController {
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("RealisticController")
+      .SetParent<SpProactiveController>()
+      .SetGroupName("OFSwitch13")
+      .AddConstructor<RealisticController>();
+    return tid;
+  }
+
+  RealisticController() : m_controlPlaneDelay(MilliSeconds(5)) {
+    m_processingRng = CreateObject<UniformRandomVariable>();
+    m_processingRng->SetAttribute("Min", DoubleValue(2.0));
+    m_processingRng->SetAttribute("Max", DoubleValue(8.0));
+  }
+
+protected:
+  virtual void HandshakeSuccessful(Ptr<const RemoteSwitch> swtch) override {
+    uint64_t dpid = swtch->GetDpId();
+    NS_LOG_INFO("RealisticController: Switch " << dpid << " connected at " 
+                << Simulator::Now().GetSeconds() << "s");
+    
+    // Record first switch connection for convergence metrics
+    ControlPlaneMetrics::RecordFirstSwitch();
+    
+    // Emulate controller processing delay
+    Time processingDelay = MilliSeconds(m_processingRng->GetValue());
+    
+    Simulator::Schedule(processingDelay, [this, dpid]() {
+      InstallTableMissDrop(dpid);
+      // Stagger flow installations to prevent control plane flooding
+      PushFlowsWithRateLimit(dpid);
+    });
+  }
+
+private:
+  void PushFlowsWithRateLimit(uint64_t dpid) {
+    const uint32_t FLOWS_PER_BATCH = 50;
+    const Time BATCH_INTERVAL = MilliSeconds(10);
+    
+    auto flowsToInstall = ComputeFlowsForSwitch(dpid);
+    
+    for (size_t i = 0; i < flowsToInstall.size(); i += FLOWS_PER_BATCH) {
+      Time delay = BATCH_INTERVAL * (i / FLOWS_PER_BATCH);
+      
+      Simulator::Schedule(delay + m_controlPlaneDelay, [this, dpid, flowsToInstall, i]() {
+        ControlPlaneMetrics::RecordBatch();
+        
+        size_t end = std::min(i + FLOWS_PER_BATCH, flowsToInstall.size());
+        for (size_t j = i; j < end; ++j) {
+          DpctlExecuteDelayed(dpid, flowsToInstall[j]);
+        }
+        
+        NS_LOG_DEBUG("Installed flow batch " << i/FLOWS_PER_BATCH 
+                     << " on switch " << dpid);
+      });
+    }
+  }
+
+  std::vector<std::string> ComputeFlowsForSwitch(uint64_t dpid) {
+    std::vector<std::string> flows;
+    
+    // Compute all flows that need to be installed for this switch
+    for (const auto& host : m_hosts) {
+      Port outPort;
+      if (dpid == host.edgeSw) {
+        outPort = host.edgePort; // Direct delivery to host
+      } else {
+        if (!NextHopPort(dpid, host.edgeSw, outPort)) {
+          continue; // No path available
+        }
+      }
+      
+      // Create ARP rule command
+      std::ostringstream arpCmd;
+      arpCmd << "flow-mod cmd=add,table=0,prio=200"
+             << " eth_type=0x0806,arp_tpa=" << host.ip
+             << " apply:output=" << outPort;
+      flows.push_back(arpCmd.str());
+
+      // Create IPv4 rule command  
+      std::ostringstream ipCmd;
+      ipCmd << "flow-mod cmd=add,table=0,prio=100"
+            << " eth_type=0x0800,eth_dst=" << host.mac
+            << " apply:output=" << outPort;
+      flows.push_back(ipCmd.str());
+    }
+    
+    NS_LOG_INFO("Computed " << flows.size() << " flows for switch " << dpid);
+    return flows;
+  }
+
+  void DpctlExecuteDelayed(uint64_t dpid, const std::string& cmd) {
+    // Add small random jitter to simulate OpenFlow message processing
+    Time jitter = MicroSeconds(m_processingRng->GetValue() * 100);
+    
+    Simulator::Schedule(jitter, [this, dpid, cmd]() {
+      ControlPlaneMetrics::RecordFlowInstall();
+      
+      auto out = DpctlExecute(dpid, cmd);
+      if (DpctlFailed(out)) {
+        ++g_dpctlErrors;
+        NS_LOG_WARN("RealisticController: dpctl problem dpid=" << std::hex << dpid
+                    << " cmd='" << cmd << "' -> " << DpctlToString(out));
+      } else {
+        NS_LOG_DEBUG("RealisticController: dpctl ok dpid=" << std::hex << dpid);
+      }
+    });
+  }
+
+private:
+  Time m_controlPlaneDelay;
+  Ptr<UniformRandomVariable> m_processingRng;
 };
 
 // Telemetry callbacks for queue monitoring
@@ -509,6 +664,9 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // QoS parameters
     std::string qosMark = "CS6"; // or "EF"
     
+    // Controller parameters
+    bool realisticController = true;  // Use realistic control plane delays
+    
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
     cmd.AddValue("run", "RNG run number", run);
@@ -526,6 +684,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
     cmd.AddValue("qdiscOnSwitch", "Install PfifoFast on switch ports too", qdiscOnSwitch);
     cmd.AddValue("qosMark", "QKD priority mark: EF or CS6", qosMark);
+    cmd.AddValue("realisticController", "Use realistic control plane delays", realisticController);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -550,7 +709,15 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     
     // --- Create the proactive controller and wire topology info ---
     Ptr<Node> controllerNode = CreateObject<Node>();
-    Ptr<SpProactiveController> ctrl = CreateObject<SpProactiveController>();
+    Ptr<SpProactiveController> ctrl;
+    
+    if (realisticController) {
+      ctrl = CreateObject<RealisticController>();
+      std::cout << "Using RealisticController with control-plane latency emulation" << std::endl;
+    } else {
+      ctrl = CreateObject<SpProactiveController>();
+      std::cout << "Using basic SpProactiveController (no latency emulation)" << std::endl;
+    }
 
     // Install controller and switches then open channels
     Ptr<OFSwitch13InternalHelper> of13 = CreateObject<OFSwitch13InternalHelper>();
@@ -908,6 +1075,11 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
       totalBeRx += DynamicCast<PacketSink>(sinkApps.Get(i))->GetTotalRx();
     }
     auto qctrlRx = DynamicCast<PacketSink>(qctrlSinkApp.Get(0))->GetTotalRx();
+    
+    // Print control plane metrics if using realistic controller
+    if (realisticController) {
+      ControlPlaneMetrics::PrintSummary();
+    }
     
     if (usingCsv) {
       std::cout << "MAN from CSV: " << topoPath << " (" << topo.host.size() << " hosts)\n";
