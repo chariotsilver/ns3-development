@@ -436,6 +436,10 @@ public:
   // Inject topology and hosts before StartApplication()
   void SetAdjacency(const SwAdj& adj) { m_adj = adj; }
   void SetHosts(const std::vector<HostInfo>& hosts) { m_hosts = hosts; }
+  void SetMultiPathConfig(bool enabled, uint32_t maxPaths) { 
+    m_multiPathEnabled = enabled; 
+    m_maxPaths = maxPaths;
+  }
 
   // (no-op: remapping done in main now)
 
@@ -478,101 +482,192 @@ protected:
     DpctlOrWarn("table-miss", dpid, "flow-mod cmd=add,table=0,prio=0 apply:");
   }
 
-  void PushFlowsForSwitch(uint64_t dpid) {
-    NS_LOG_DEBUG("push flows for DPID=" << dpid << " (hosts=" << m_hosts.size() << ")");
+  void InstallSimpleFlow(uint64_t dpid, const HostInfo& host, Port outPort) {
+    // Install ARP rule
+    std::ostringstream arpCmd;
+    arpCmd << "flow-mod cmd=add,table=0,prio=200"
+           << " eth_type=0x0806,arp_tpa=" << host.ip
+           << " apply:output=" << outPort;
+    DpctlOrWarn("ARP", dpid, arpCmd.str());
+
+    // Install IPv4 rule
+    std::ostringstream ipCmd;
+    ipCmd << "flow-mod cmd=add,table=0,prio=100"
+          << " eth_type=0x0800,eth_dst=" << host.mac
+          << " apply:output=" << outPort;
+    DpctlOrWarn("IPv4", dpid, ipCmd.str());
+  }
+
+  void InstallMultiPathFlows(uint64_t dpid) {
+    NS_LOG_DEBUG("Installing multi-path flows for DPID=" << dpid);
     
-    // Install ARP and IPv4 rules for all hosts that can reach this switch
     for (const auto& host : m_hosts) {
       Port outPort;
       if (dpid == host.edgeSw) {
         outPort = host.edgePort; // Direct delivery to host
+        InstallSimpleFlow(dpid, host, outPort);
         NS_LOG_DEBUG("host " << host.ip << " directly on " << dpid << " port " << outPort);
       } else {
-        if (!NextHopPort(dpid, host.edgeSw, outPort)) {
+        auto paths = ComputeKShortestPaths(dpid, host.edgeSw, m_multiPathEnabled ? m_maxPaths : 1);
+        
+        if (paths.empty()) {
           NS_LOG_WARN("no path from DPID " << dpid << " to host " << host.ip
                      << " (edgeSw=" << host.edgeSw << ")");
           continue;
         }
-        NS_LOG_DEBUG("host " << host.ip << " via DPID " << dpid << " out port " << outPort);
+        
+        if (paths.size() == 1 || !m_multiPathEnabled) {
+          // Single path: traditional flow
+          InstallSimpleFlow(dpid, host, paths[0].nextHop);
+          NS_LOG_DEBUG("host " << host.ip << " single path via DPID " << dpid 
+                       << " out port " << paths[0].nextHop);
+        } else {
+          // Multiple paths: use priority-based failover instead of groups
+          // Install flows in decreasing priority order (highest priority = primary path)
+          for (size_t i = 0; i < paths.size(); ++i) {
+            uint32_t priority = 150 - i; // Primary=150, backup1=149, backup2=148...
+            
+            // Install ARP rule for this path
+            std::ostringstream arpCmd;
+            arpCmd << "flow-mod cmd=add,table=0,prio=" << priority
+                   << " eth_type=0x0806,arp_tpa=" << host.ip
+                   << " apply:output=" << paths[i].nextHop;
+            DpctlOrWarn("ARP-MP", dpid, arpCmd.str());
+
+            // Install IPv4 rule for this path
+            std::ostringstream ipCmd;
+            ipCmd << "flow-mod cmd=add,table=0,prio=" << priority
+                  << " eth_type=0x0800,eth_dst=" << host.mac
+                  << " apply:output=" << paths[i].nextHop;
+            DpctlOrWarn("IPv4-MP", dpid, ipCmd.str());
+          }
+          
+          NS_LOG_INFO("MultiPath: sw=" << std::hex << dpid << " -> " << host.ip
+                     << " installed " << std::dec << paths.size() << " priority-based paths");
+        }
       }
       
-      // Install ARP rule
-      std::ostringstream arpCmd;
-      arpCmd << "flow-mod cmd=add,table=0,prio=200"
-             << " eth_type=0x0806,arp_tpa=" << host.ip
-             << " apply:output=" << outPort;
-      DpctlOrWarn("ARP", dpid, arpCmd.str());
-
-      // Install IPv4 rule
-      std::ostringstream ipCmd;
-      ipCmd << "flow-mod cmd=add,table=0,prio=100"
-            << " eth_type=0x0800,eth_dst=" << host.mac
-            << " apply:output=" << outPort;
-      DpctlOrWarn("IPv4", dpid, ipCmd.str());
-
       // One-time next-hop log per (switch, host-IP)
       if (m_loggedNextHop.emplace(dpid, host.ip.Get()).second) {
-        NS_LOG_INFO("NextHop: sw=" << std::hex << dpid << " -> " << host.ip
-                     << " via port " << std::dec << outPort);
+        if (dpid != host.edgeSw) {
+          auto paths = ComputeKShortestPaths(dpid, host.edgeSw, m_multiPathEnabled ? m_maxPaths : 1);
+          if (paths.size() > 1) {
+            NS_LOG_INFO("NextHop: sw=" << std::hex << dpid << " -> " << host.ip
+                       << " multi-path (" << paths.size() << " paths available)");
+          } else {
+            NS_LOG_INFO("NextHop: sw=" << std::hex << dpid << " -> " << host.ip
+                       << " via port " << std::dec << (paths.empty() ? 0 : paths[0].nextHop));
+          }
+        } else {
+          NS_LOG_INFO("NextHop: sw=" << std::hex << dpid << " -> " << host.ip
+                     << " direct connection via port " << std::dec << host.edgePort);
+        }
       }
     }
   }
 
-  bool NextHopPort(Sw src, Sw dst, Port& outPort) {
-    if (src == dst) return false;
+  void PushFlowsForSwitch(uint64_t dpid) {
+    NS_LOG_DEBUG("push flows for DPID=" << dpid << " (hosts=" << m_hosts.size() << ")");
+    InstallMultiPathFlows(dpid);
+  }
 
-    std::queue<Sw> q;
-    std::unordered_map<Sw, Sw> parent;
-    std::unordered_set<Sw> visited;
+  struct PathInfo {
+    Port nextHop;
+    uint32_t cost;
+    std::vector<Sw> fullPath;
+  };
 
-    q.push(src);
-    visited.insert(src);
-    parent[src] = src;
+  std::vector<PathInfo> ComputeKShortestPaths(Sw src, Sw dst, uint32_t k) {
+    std::vector<PathInfo> paths;
+    if (src == dst) return paths;
 
-    while (!q.empty()) {
-      Sw curr = q.front();
-      q.pop();
+    // Use modified Dijkstra with path tracking for k-shortest paths
+    struct PathState {
+      Sw node;
+      uint32_t cost;
+      std::vector<Sw> path;
+      Port firstHop;
+    };
 
-      if (curr == dst) {
-        // Trace back to find next hop
-        Sw next = dst;
-        while (parent[next] != src) {
-          next = parent[next];
-        }
-        auto it = m_adj.find(src);
-        if (it != m_adj.end()) {
-          for (const auto& [port, peer] : it->second) {
-            if (peer.isSwitch && peer.sw == next) {
-              outPort = port;
-              return true;
-            }
-          }
-        }
-        return false;
+    auto cmp = [](const PathState& a, const PathState& b) { return a.cost > b.cost; };
+    std::priority_queue<PathState, std::vector<PathState>, decltype(cmp)> pq(cmp);
+    std::map<Sw, uint32_t> bestCost;
+
+    // Initialize with source
+    pq.push({src, 0, {src}, 0});
+
+    while (!pq.empty() && paths.size() < k) {
+      PathState current = pq.top();
+      pq.pop();
+
+      // Skip if we've found a better path to this node
+      if (bestCost.count(current.node) && bestCost[current.node] < current.cost) {
+        continue;
       }
 
-      auto it = m_adj.find(curr);
+      if (current.node == dst) {
+        // Found a path to destination
+        PathInfo pathInfo;
+        pathInfo.nextHop = current.firstHop;
+        pathInfo.cost = current.cost;
+        pathInfo.fullPath = current.path;
+        paths.push_back(pathInfo);
+        
+        // Allow finding more paths through this node with higher cost
+        bestCost[current.node] = current.cost + 1;
+        continue;
+      }
+
+      // Update best cost for this node
+      if (!bestCost.count(current.node) || bestCost[current.node] > current.cost) {
+        bestCost[current.node] = current.cost;
+      }
+
+      // Explore neighbors
+      auto it = m_adj.find(current.node);
       if (it != m_adj.end()) {
         for (const auto& [port, peer] : it->second) {
-          if (peer.isSwitch && visited.find(peer.sw) == visited.end()) {
-            visited.insert(peer.sw);
-            parent[peer.sw] = curr;
-            q.push(peer.sw);
-          }
+          if (!peer.isSwitch) continue;
+
+          // Avoid cycles in path
+          bool inPath = std::find(current.path.begin(), current.path.end(), peer.sw) != current.path.end();
+          if (inPath) continue;
+
+          PathState nextState;
+          nextState.node = peer.sw;
+          nextState.cost = current.cost + 1; // Unit cost per hop
+          nextState.path = current.path;
+          nextState.path.push_back(peer.sw);
+          nextState.firstHop = (current.node == src) ? port : current.firstHop;
+
+          pq.push(nextState);
         }
       }
     }
-    // No path found: warn once per (src,dst)
-    auto key = std::make_pair(src, dst);
-    if (m_warnedNoPath.insert(key).second) {
-      NS_LOG_WARN("NextHopPort: no path from " << src << " to " << dst);
+
+    return paths;
+  }
+
+  bool NextHopPort(Sw src, Sw dst, Port& outPort) {
+    auto paths = ComputeKShortestPaths(src, dst, 1);
+    if (paths.empty()) {
+      // No path found: warn once per (src,dst)
+      auto key = std::make_pair(src, dst);
+      if (m_warnedNoPath.insert(key).second) {
+        NS_LOG_WARN("NextHopPort: no path from " << src << " to " << dst);
+      }
+      return false;
     }
-    return false;
+    
+    outPort = paths[0].nextHop;
+    return true;
   }
 
 protected:
   SwAdj m_adj;
   std::vector<HostInfo> m_hosts;
+  bool m_multiPathEnabled{true};
+  uint32_t m_maxPaths{3};
 
 private:
   std::set<std::pair<Sw,Sw>> m_warnedNoPath;
@@ -645,28 +740,71 @@ private:
     
     // Compute all flows that need to be installed for this switch
     for (const auto& host : m_hosts) {
-      Port outPort;
       if (dpid == host.edgeSw) {
-        outPort = host.edgePort; // Direct delivery to host
+        // Direct delivery to host - simple flows
+        Port outPort = host.edgePort;
+        
+        // Create ARP rule command
+        std::ostringstream arpCmd;
+        arpCmd << "flow-mod cmd=add,table=0,prio=200"
+               << " eth_type=0x0806,arp_tpa=" << host.ip
+               << " apply:output=" << outPort;
+        flows.push_back(arpCmd.str());
+
+        // Create IPv4 rule command  
+        std::ostringstream ipCmd;
+        ipCmd << "flow-mod cmd=add,table=0,prio=100"
+               << " eth_type=0x0800,eth_dst=" << host.mac
+               << " apply:output=" << outPort;
+        flows.push_back(ipCmd.str());
+        
       } else {
-        if (!NextHopPort(dpid, host.edgeSw, outPort)) {
+        auto paths = ComputeKShortestPaths(dpid, host.edgeSw, m_multiPathEnabled ? m_maxPaths : 1);
+        
+        if (paths.empty()) {
           continue; // No path available
         }
-      }
-      
-      // Create ARP rule command
-      std::ostringstream arpCmd;
-      arpCmd << "flow-mod cmd=add,table=0,prio=200"
-             << " eth_type=0x0806,arp_tpa=" << host.ip
-             << " apply:output=" << outPort;
-      flows.push_back(arpCmd.str());
+        
+        if (paths.size() == 1 || !m_multiPathEnabled) {
+          // Single path: traditional flows
+          Port outPort = paths[0].nextHop;
+          
+          // Create ARP rule command
+          std::ostringstream arpCmd;
+          arpCmd << "flow-mod cmd=add,table=0,prio=200"
+                 << " eth_type=0x0806,arp_tpa=" << host.ip
+                 << " apply:output=" << outPort;
+          flows.push_back(arpCmd.str());
 
-      // Create IPv4 rule command  
-      std::ostringstream ipCmd;
-      ipCmd << "flow-mod cmd=add,table=0,prio=100"
-            << " eth_type=0x0800,eth_dst=" << host.mac
-            << " apply:output=" << outPort;
-      flows.push_back(ipCmd.str());
+          // Create IPv4 rule command  
+          std::ostringstream ipCmd;
+          ipCmd << "flow-mod cmd=add,table=0,prio=100"
+                 << " eth_type=0x0800,eth_dst=" << host.mac
+                 << " apply:output=" << outPort;
+          flows.push_back(ipCmd.str());
+          
+        } else {
+          // Multiple paths: use priority-based failover instead of groups
+          // Install flows in decreasing priority order (highest priority = primary path)
+          for (size_t i = 0; i < paths.size(); ++i) {
+            uint32_t priority = 150 - i; // Primary=150, backup1=149, backup2=148...
+            
+            // Create ARP rule command
+            std::ostringstream arpCmd;
+            arpCmd << "flow-mod cmd=add,table=0,prio=" << priority
+                   << " eth_type=0x0806,arp_tpa=" << host.ip
+                   << " apply:output=" << paths[i].nextHop;
+            flows.push_back(arpCmd.str());
+
+            // Create IPv4 rule command
+            std::ostringstream ipCmd;
+            ipCmd << "flow-mod cmd=add,table=0,prio=" << priority
+                  << " eth_type=0x0800,eth_dst=" << host.mac
+                  << " apply:output=" << paths[i].nextHop;
+            flows.push_back(ipCmd.str());
+          }
+        }
+      }
     }
     
     NS_LOG_INFO("Computed " << flows.size() << " flows for switch " << dpid);
@@ -996,6 +1134,10 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Link failure parameters
     bool enableLinkFailures = false;  // Enable link failure simulation
     
+    // Multi-path parameters
+    bool enableMultiPath = true;      // Enable multi-path routing with fast failover
+    uint32_t maxPaths = 3;            // Maximum number of paths to compute
+    
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
     cmd.AddValue("run", "RNG run number", run);
@@ -1015,6 +1157,8 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     cmd.AddValue("qosMark", "QKD priority mark: EF or CS6", qosMark);
     cmd.AddValue("realisticController", "Use realistic control plane delays", realisticController);
     cmd.AddValue("enableLinkFailures", "Enable link failure simulation for robustness testing", enableLinkFailures);
+    cmd.AddValue("enableMultiPath", "Enable multi-path routing with fast failover", enableMultiPath);
+    cmd.AddValue("maxPaths", "Maximum number of paths to compute for multi-path routing", maxPaths);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -1025,6 +1169,16 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     uint8_t qosTos = (qosMark == "EF" ? 0xB8 : 0xC0); // EF=0xb8, CS6=0xc0
     std::cout << "QKD control traffic using " << qosMark << " marking (TOS=0x" 
               << std::hex << (uint32_t)qosTos << std::dec << ")" << std::endl;
+
+    // Validate multi-path configuration
+    if (enableMultiPath && maxPaths < 2) {
+      std::cout << "WARNING: Multi-path enabled but maxPaths < 2, setting to 2" << std::endl;
+      maxPaths = 2;
+    }
+    if (maxPaths > 8) {
+      std::cout << "WARNING: maxPaths > 8 may cause performance issues, capping at 8" << std::endl;
+      maxPaths = 8;
+    }
 
     // Build topology
     TopoBuild topo;
@@ -1222,7 +1376,14 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Set DPID-keyed topology on controller (no remapping needed)
     ctrl->SetAdjacency(adjDpid);
     ctrl->SetHosts(hostsDpid);
+    ctrl->SetMultiPathConfig(enableMultiPath, maxPaths);
+    
     std::cout << "DEBUG: Configured controller with " << adjDpid.size() << " switches and " << hostsDpid.size() << " hosts (DPID keys)" << std::endl;
+    if (enableMultiPath) {
+      std::cout << "DEBUG: Multi-path routing ENABLED (maxPaths=" << maxPaths << ")" << std::endl;
+    } else {
+      std::cout << "DEBUG: Multi-path routing DISABLED (single-path only)" << std::endl;
+    }
 
     // Now open channels; HandshakeSuccessful will push flows immediately
     of13->CreateOpenFlowChannels();
@@ -1442,6 +1603,11 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     } else {
       std::cout << "MAN with " << nCore << " core switches\n";
     }
+    std::cout << "Multi-path routing: " << (enableMultiPath ? "ENABLED" : "DISABLED");
+    if (enableMultiPath) {
+      std::cout << " (maxPaths=" << maxPaths << ")";
+    }
+    std::cout << "\n";
     std::cout << "Total BE RX: " << totalBeRx << " bytes\n";
     std::cout << "QKD control RX (host" << qSrc << "→host" << qDst << "): " << qctrlRx << " bytes\n";
     
