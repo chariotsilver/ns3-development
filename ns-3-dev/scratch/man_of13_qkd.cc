@@ -26,6 +26,329 @@
 
 using namespace ns3;
 
+// Link Failure and Recovery Module for Network Robustness Testing
+enum class FailureType {
+  FIBER_CUT,      // Complete link failure
+  TRANSIENT,      // Temporary failure (flapping)
+  DEGRADATION     // Gradual performance degradation
+};
+
+struct LinkFailureEvent {
+  Time scheduleTime;
+  FailureType type;
+  uint32_t linkId;
+  std::string description;
+  double parameter1;  // For degradation: loss rate
+  double parameter2;  // For degradation: additional delay
+};
+
+class LinkFailureModule {
+public:
+  LinkFailureModule() {
+    m_failureLog.open("link_failures.log");
+    m_failureLog << "# Time,Event,Type,LinkId,Description,Parameter1,Parameter2\n";
+    m_linkIdCounter = 0;
+    m_enableFailures = false;
+  }
+
+  ~LinkFailureModule() {
+    if (m_failureLog.is_open()) {
+      m_failureLog.close();
+    }
+  }
+
+  void EnableFailures(bool enable) { m_enableFailures = enable; }
+
+  void RegisterLink(NetDeviceContainer link, const std::string& description = "") {
+    uint32_t linkId = m_linkIdCounter++;
+    m_coreLinks[linkId] = link;
+    m_linkDescriptions[linkId] = description.empty() 
+      ? ("Link_" + std::to_string(linkId)) : description;
+    m_linkStates[linkId] = true; // Initially operational
+    
+    NS_LOG_INFO("LinkFailureModule: Registered link " << linkId 
+                << " (" << m_linkDescriptions[linkId] << ")");
+  }
+
+  void ScheduleRealisticFailures() {
+    if (!m_enableFailures) {
+      NS_LOG_INFO("LinkFailureModule: Failure simulation disabled");
+      return;
+    }
+
+    if (m_coreLinks.size() < 4) {
+      NS_LOG_WARN("LinkFailureModule: Need at least 4 links for realistic failure scenarios");
+      return;
+    }
+
+    NS_LOG_INFO("LinkFailureModule: Scheduling realistic failure scenarios...");
+
+    // Scenario 1: Fiber cut simulation (complete failure)
+    ScheduleEvent({
+      Seconds(30.0),
+      FailureType::FIBER_CUT,
+      2,
+      "Primary_Core_Link_Failure",
+      0.0, 0.0
+    });
+
+    // Scenario 2: Gradual degradation (increasing packet loss)
+    ScheduleEvent({
+      Seconds(20.0),
+      FailureType::DEGRADATION,
+      1,
+      "Link_Quality_Degradation",
+      0.001,  // Initial loss rate: 0.1%
+      5.0     // Additional delay: 5ms
+    });
+
+    // Enhanced degradation over time
+    ScheduleEvent({
+      Seconds(35.0),
+      FailureType::DEGRADATION,
+      1,
+      "Severe_Link_Degradation",
+      0.01,   // Increased loss rate: 1%
+      15.0    // Additional delay: 15ms
+    });
+
+    // Scenario 3: Flapping link (intermittent failures)
+    Time flapStart = Seconds(40.0);
+    for (int i = 0; i < 10; ++i) {
+      FailureType type = (i % 2 == 0) ? FailureType::TRANSIENT : FailureType::TRANSIENT;
+      ScheduleEvent({
+        flapStart + Seconds(i * 3.0),
+        type,
+        3,
+        i % 2 == 0 ? "Link_Flap_Down" : "Link_Flap_Up",
+        0.0, 0.0
+      });
+    }
+
+    // Scenario 4: Recovery test - restore fiber cut link
+    ScheduleEvent({
+      Seconds(80.0),
+      FailureType::TRANSIENT, // Using TRANSIENT type for restoration
+      2,
+      "Fiber_Cut_Recovery",
+      0.0, 0.0
+    });
+
+    // Scenario 5: Multiple simultaneous failures (stress test)
+    if (m_coreLinks.size() >= 6) {
+      ScheduleEvent({
+        Seconds(90.0),
+        FailureType::FIBER_CUT,
+        4,
+        "Simultaneous_Failure_1",
+        0.0, 0.0
+      });
+
+      ScheduleEvent({
+        Seconds(90.5),
+        FailureType::FIBER_CUT,
+        5,
+        "Simultaneous_Failure_2",
+        0.0, 0.0
+      });
+    }
+
+    NS_LOG_INFO("LinkFailureModule: Scheduled " << m_scheduledEvents.size() << " failure events");
+  }
+
+  void PrintFailureSummary() {
+    std::cout << "\n=== Link Failure Summary ===" << std::endl;
+    std::cout << "Total registered links: " << m_coreLinks.size() << std::endl;
+    std::cout << "Scheduled failure events: " << m_scheduledEvents.size() << std::endl;
+    
+    uint32_t operational = 0;
+    for (const auto& [linkId, state] : m_linkStates) {
+      if (state) operational++;
+    }
+    
+    std::cout << "Currently operational links: " << operational 
+              << "/" << m_linkStates.size() << std::endl;
+    std::cout << "Failure log: link_failures.log" << std::endl;
+    std::cout << "===========================" << std::endl;
+  }
+
+private:
+  void ScheduleEvent(const LinkFailureEvent& event) {
+    m_scheduledEvents.push_back(event);
+    
+    Simulator::Schedule(event.scheduleTime, [this, event]() {
+      ExecuteFailureEvent(event);
+    });
+  }
+
+  void ExecuteFailureEvent(const LinkFailureEvent& event) {
+    auto linkIt = m_coreLinks.find(event.linkId);
+    if (linkIt == m_coreLinks.end()) {
+      NS_LOG_ERROR("LinkFailureModule: Link " << event.linkId << " not found");
+      return;
+    }
+
+    NetDeviceContainer& link = linkIt->second;
+    bool currentState = m_linkStates[event.linkId];
+
+    switch (event.type) {
+      case FailureType::FIBER_CUT:
+        if (currentState) {
+          FailLink(link, event.linkId, "FIBER_CUT");
+        } else {
+          RestoreLink(link, event.linkId, "FIBER_RESTORE");
+        }
+        break;
+
+      case FailureType::TRANSIENT:
+        if (event.description.find("Up") != std::string::npos || 
+            event.description.find("Recovery") != std::string::npos) {
+          RestoreLink(link, event.linkId, "TRANSIENT_RESTORE");
+        } else {
+          FailLink(link, event.linkId, "TRANSIENT_FAIL");
+        }
+        break;
+
+      case FailureType::DEGRADATION:
+        DegradeLink(link, event.linkId, event.parameter1, event.parameter2);
+        break;
+    }
+
+    // Log the event
+    LogFailureEvent(event);
+  }
+
+  void FailLink(NetDeviceContainer& link, uint32_t linkId, const std::string& reason) {
+    if (!m_linkStates[linkId]) {
+      NS_LOG_DEBUG("LinkFailureModule: Link " << linkId << " already failed");
+      return;
+    }
+
+    // Disable transmission on both ends of the link
+    Ptr<CsmaNetDevice> dev0 = DynamicCast<CsmaNetDevice>(link.Get(0));
+    Ptr<CsmaNetDevice> dev1 = DynamicCast<CsmaNetDevice>(link.Get(1));
+
+    if (dev0) {
+      // Disable the device by setting it to a non-transmitting state
+      dev0->GetQueue()->SetMaxSize(QueueSize("0p"));
+    }
+    if (dev1) {
+      dev1->GetQueue()->SetMaxSize(QueueSize("0p"));
+    }
+
+    m_linkStates[linkId] = false;
+
+    NS_LOG_WARN("LinkFailureModule: FAILED link " << linkId 
+                << " (" << m_linkDescriptions[linkId] << ") - " << reason);
+
+    // Notify controller about link state change
+    NotifyController(linkId, false);
+  }
+
+  void RestoreLink(NetDeviceContainer& link, uint32_t linkId, const std::string& reason) {
+    if (m_linkStates[linkId]) {
+      NS_LOG_DEBUG("LinkFailureModule: Link " << linkId << " already operational");
+      return;
+    }
+
+    // Re-enable transmission on both ends
+    Ptr<CsmaNetDevice> dev0 = DynamicCast<CsmaNetDevice>(link.Get(0));
+    Ptr<CsmaNetDevice> dev1 = DynamicCast<CsmaNetDevice>(link.Get(1));
+
+    if (dev0) {
+      dev0->GetQueue()->SetMaxSize(QueueSize("100p")); // Restore default queue size
+    }
+    if (dev1) {
+      dev1->GetQueue()->SetMaxSize(QueueSize("100p"));
+    }
+
+    // Remove any error models that might have been added
+    Ptr<CsmaNetDevice> csma0 = DynamicCast<CsmaNetDevice>(link.Get(0));
+    Ptr<CsmaNetDevice> csma1 = DynamicCast<CsmaNetDevice>(link.Get(1));
+    if (csma0) csma0->SetReceiveErrorModel(nullptr);
+    if (csma1) csma1->SetReceiveErrorModel(nullptr);
+
+    m_linkStates[linkId] = true;
+
+    NS_LOG_INFO("LinkFailureModule: RESTORED link " << linkId 
+                << " (" << m_linkDescriptions[linkId] << ") - " << reason);
+
+    // Notify controller about link restoration
+    NotifyController(linkId, true);
+  }
+
+  void DegradeLink(NetDeviceContainer& link, uint32_t linkId, double lossRate, double additionalDelay) {
+    NS_LOG_INFO("LinkFailureModule: DEGRADING link " << linkId 
+                << " loss=" << lossRate << " delay=+" << additionalDelay << "ms");
+
+    // Add packet loss error model
+    Ptr<RateErrorModel> errorModel0 = CreateObject<RateErrorModel>();
+    errorModel0->SetRate(lossRate);
+    errorModel0->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+
+    Ptr<RateErrorModel> errorModel1 = CreateObject<RateErrorModel>();
+    errorModel1->SetRate(lossRate);
+    errorModel1->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
+
+    // Cast to CsmaNetDevice which supports error models
+    Ptr<CsmaNetDevice> dev0 = DynamicCast<CsmaNetDevice>(link.Get(0));
+    Ptr<CsmaNetDevice> dev1 = DynamicCast<CsmaNetDevice>(link.Get(1));
+
+    if (dev0) {
+      dev0->SetReceiveErrorModel(errorModel0);
+    }
+    if (dev1) {
+      dev1->SetReceiveErrorModel(errorModel1);
+    }
+
+    // Note: Adding delay variation would require custom channel implementation
+    // For now, we log the intended delay increase for analysis
+    
+    m_failureLog << Simulator::Now().GetSeconds() 
+                 << ",LINK_DEGRADE,QUALITY_LOSS," << linkId 
+                 << "," << m_linkDescriptions[linkId]
+                 << "," << lossRate << "," << additionalDelay << "\n";
+  }
+
+  void NotifyController(uint32_t linkId, bool isUp) {
+    // In a real implementation, this would trigger OpenFlow port status messages
+    // For simulation purposes, we log the event for controller awareness
+    std::string status = isUp ? "PORT_UP" : "PORT_DOWN";
+    
+    m_failureLog << Simulator::Now().GetSeconds() 
+                 << ",PORT_STATUS," << status << "," << linkId
+                 << "," << m_linkDescriptions[linkId] 
+                 << ",0,0\n";
+
+    NS_LOG_INFO("LinkFailureModule: Notified controller - Link " << linkId 
+                << " status: " << status);
+  }
+
+  void LogFailureEvent(const LinkFailureEvent& event) {
+    std::string typeStr;
+    switch (event.type) {
+      case FailureType::FIBER_CUT: typeStr = "FIBER_CUT"; break;
+      case FailureType::TRANSIENT: typeStr = "TRANSIENT"; break;
+      case FailureType::DEGRADATION: typeStr = "DEGRADATION"; break;
+    }
+
+    m_failureLog << Simulator::Now().GetSeconds() 
+                 << ",SCHEDULED_EVENT," << typeStr << "," << event.linkId
+                 << "," << event.description
+                 << "," << event.parameter1 << "," << event.parameter2 << "\n";
+    m_failureLog.flush();
+  }
+
+private:
+  std::unordered_map<uint32_t, NetDeviceContainer> m_coreLinks;
+  std::unordered_map<uint32_t, std::string> m_linkDescriptions;
+  std::unordered_map<uint32_t, bool> m_linkStates;
+  std::vector<LinkFailureEvent> m_scheduledEvents;
+  std::ofstream m_failureLog;
+  uint32_t m_linkIdCounter;
+  bool m_enableFailures;
+};
+
 // Control plane metrics tracking
 struct ControlPlaneMetrics {
   static inline Time firstSwitchTime = Time(0);
@@ -65,6 +388,9 @@ NS_LOG_COMPONENT_DEFINE("SpProactiveController");
 // Global variables for error tracking and verbosity
 static std::atomic<uint32_t> g_dpctlErrors{0};
 static uint32_t g_verbosity = 1;  // Default verbosity level
+
+// Global link failure module for robustness testing
+static LinkFailureModule g_linkFailures;
 
 // Returns true if this build exposes the "Limit" attribute on PfifoFastQueueDisc
 static bool PfifoHasLimitAttr() {
@@ -667,6 +993,9 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Controller parameters
     bool realisticController = true;  // Use realistic control plane delays
     
+    // Link failure parameters
+    bool enableLinkFailures = false;  // Enable link failure simulation
+    
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
     cmd.AddValue("run", "RNG run number", run);
@@ -685,6 +1014,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     cmd.AddValue("qdiscOnSwitch", "Install PfifoFast on switch ports too", qdiscOnSwitch);
     cmd.AddValue("qosMark", "QKD priority mark: EF or CS6", qosMark);
     cmd.AddValue("realisticController", "Use realistic control plane delays", realisticController);
+    cmd.AddValue("enableLinkFailures", "Enable link failure simulation for robustness testing", enableLinkFailures);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -705,6 +1035,12 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
       topo = BuildFromCsv(topoPath, txQueueMaxP);
     } else {
       man = BuildMan(nCore, "10Gbps", "0.5ms", "1Gbps", "0.2ms", enableRing, txQueueMaxP);
+    }
+    
+    // Initialize link failure module
+    g_linkFailures.EnableFailures(enableLinkFailures);
+    if (enableLinkFailures) {
+      std::cout << "Link failure simulation ENABLED - will test network robustness" << std::endl;
     }
     
     // --- Create the proactive controller and wire topology info ---
@@ -770,6 +1106,16 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     } else {
       for (auto& hl : man.hostLinks) { hostDevs.Add(hl.Get(0)); spurLinks.push_back(hl); }
       for (auto& cl : man.coreLinks) coreLinks.push_back(cl);
+    }
+
+    // Register core links with failure module for robustness testing
+    if (enableLinkFailures) {
+      for (size_t i = 0; i < coreLinks.size(); ++i) {
+        std::string desc = usingCsv ? 
+          ("CSV_Core_Link_" + std::to_string(i)) : 
+          ("Line_Core_Link_" + std::to_string(i));
+        g_linkFailures.RegisterLink(coreLinks[i], desc);
+      }
     }
 
     if (usingCsv) {
@@ -881,6 +1227,11 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Now open channels; HandshakeSuccessful will push flows immediately
     of13->CreateOpenFlowChannels();
     std::cout << "DEBUG: Created OpenFlow channels" << std::endl;
+
+    // Schedule link failure scenarios for robustness testing
+    if (enableLinkFailures) {
+      g_linkFailures.ScheduleRealisticFailures();
+    }
 
     // Install FlowMonitor for per-flow telemetry
     FlowMonitorHelper fmHelper;
@@ -1047,7 +1398,7 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
       });
     }
 
-    Simulator::Stop(Seconds(15.0));
+    Simulator::Stop(Seconds(enableLinkFailures ? 120.0 : 15.0));  // Extended time for link failure scenarios
     Simulator::Run();
     
     // FlowMonitor telemetry output
@@ -1079,6 +1430,11 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     // Print control plane metrics if using realistic controller
     if (realisticController) {
       ControlPlaneMetrics::PrintSummary();
+    }
+    
+    // Print link failure summary if failures were enabled
+    if (enableLinkFailures) {
+      g_linkFailures.PrintFailureSummary();
     }
     
     if (usingCsv) {
