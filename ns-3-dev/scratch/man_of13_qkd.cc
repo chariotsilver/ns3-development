@@ -386,6 +386,52 @@ void QkdNetDevice::ReceiveBatch (uint32_t) { /* not used in this stub */ }
 
 /* optional helper for later: SiftAndUpdate() would live here */
 
+// --- QKD: Sessions per (src,dst) → bind devices and buffer keys -------------
+struct SessionId { 
+  uint32_t src, dst; 
+  bool operator<(const SessionId& o) const {
+    return std::tie(src,dst) < std::tie(o.src,o.dst); 
+  } 
+};
+
+struct SessionView { 
+  uint32_t buf=0, lastBits=0, nXX=0, nZZ=0; 
+  double qberX=0.0; 
+};
+
+class SessionManager {
+public:
+  void Create(SessionId s) { m_map.emplace(s, Entry{}); }
+  void Bind(SessionId s, Ptr<QkdNetDevice> tx, Ptr<QkdNetDevice> rx) { 
+    auto& e=m_map[s]; e.tx=tx; e.rx=rx; 
+  }
+  void CloseWindow(SessionId s){
+    auto it = m_map.find(s); 
+    if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
+    auto& e = it->second;
+    const auto& w = e.tx->LastWindow();             // assume symmetric windows
+    e.km.Update(w.nXX, w.nZZ, e.tx->GetRollingStats().qberX);
+    e.view.buf = e.km.Buffer(); 
+    e.view.lastBits = e.km.LastWindowBits();
+    e.view.nXX = w.nXX; 
+    e.view.nZZ = w.nZZ; 
+    e.view.qberX = e.tx->GetRollingStats().qberX;
+  }
+  uint32_t Drain(SessionId s, uint32_t n){ 
+    return m_map[s].km.Drain(n); 
+  }
+  const SessionView& View(SessionId s){ 
+    return m_map[s].view; 
+  }
+private:
+  struct Entry { 
+    Ptr<QkdNetDevice> tx, rx; 
+    QkdKeyManager km; 
+    SessionView view; 
+  };
+  std::map<SessionId, Entry> m_map;
+};
+
 }} // ns3::qkd
 
 // Link Failure and Recovery Module for Network Robustness Testing
@@ -2517,6 +2563,13 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     // Create classical load probe to monitor traffic and feed into QKD channel
     qkd::ClassicalLoadProbe classicalProbe(qch, 1530.0); // 1530 nm classical wavelength
     
+    // --- Session Management Setup ---
+    // Create session manager to track key buffers and statistics per (src,dst) pair
+    static qkd::SessionManager sessions;
+    qkd::SessionId sAB{qSrc, qDst};
+    sessions.Create(sAB);
+    sessions.Bind(sAB, alice, bob);
+    
     // Create and install classical load monitoring application
     Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
     loadMonitor->SetMonitoringPeriod(MilliSeconds(100)); // Monitor every 100ms
@@ -2627,10 +2680,15 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     };
     sendFn();
 
-    // Window close + enhanced stats with performance analysis
+    // Window close + enhanced stats with performance analysis + session tracking
     EventId winEvt;
-    std::function<void()> winFn = [&, totalKeyBits, totalWindows, avgQber, failedWindows](){
+    std::function<void()> winFn = [&, totalKeyBits, totalWindows, avgQber, failedWindows, sAB](){
       alice->EndWindow();
+      
+      // Update session manager with window closure
+      sessions.CloseWindow(sAB);
+      const auto& v = sessions.View(sAB);
+      
       auto lastWindow = alice->LastWindow();
       uint32_t windowBits = alice->Key().LastWindowBits();
       bool healthy = alice->Key().Healthy();
@@ -2643,7 +2701,7 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
         (*failedWindows)++;
       }
       
-      // Enhanced logging for QKD testing
+      // Enhanced logging for QKD testing with session information
       if (enableQkdTesting) {
         std::cout << "[QKD-" << qkdTestMode << "] Window " << *totalWindows 
                   << ": bits+=" << windowBits 
@@ -2653,6 +2711,12 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
                   << " nXX=" << lastWindow.nXX << " nZZ=" << lastWindow.nZZ
                   << " success_rate=" << std::setprecision(2) << (100.0 * (*totalWindows - *failedWindows) / *totalWindows) << "%"
                   << std::endl;
+        
+        // Additional session view output for detailed analysis
+        double rX = (v.nXX + v.nZZ) ? double(v.nXX) / (v.nXX + v.nZZ) : 0.0;
+        std::cout << "[Session-AB] bits+=" << v.lastBits << " buf=" << v.buf
+                  << " rX=" << std::fixed << std::setprecision(4) << rX
+                  << " qberX=" << v.qberX << std::endl;
       } else {
         std::cout << "QKD window: bits+=" << windowBits
                   << " buf=" << alice->Key().Buffer()
