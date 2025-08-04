@@ -112,6 +112,9 @@ public:
 
   const QkdStats& LastWindow() const { return m_last; }   // read-only view of last window
 
+  // RNG stream management for reproducibility
+  int64_t AssignStreams (int64_t stream);
+
   // minimal NetDevice overrides used by ns-3 (others can be stubs)
   Ptr<Node> GetNode() const override { return m_node; } void SetNode(Ptr<Node> n) override { m_node=n; }
   Ptr<Channel> GetChannel() const override { return m_ch; } bool IsPointToPoint() const override { return true; }
@@ -162,6 +165,7 @@ private:
 
   // RNG for batch sampling (can be replaced with ns-3 streams later)
   std::mt19937 m_rng { 0xC0FFEE }; // deterministic seed; switch to AssignStreams later
+  Ptr<UniformRandomVariable> m_u;   // for any uniform draws you might add later
   
   // Attachment tracking to prevent double-attach
   bool m_attached = false;
@@ -270,7 +274,9 @@ TypeId QkdNetDevice::GetTypeId ()
   return tid;
 }
 
-QkdNetDevice::QkdNetDevice () {}
+QkdNetDevice::QkdNetDevice () {
+  m_u = CreateObject<UniformRandomVariable>();
+}
 
 void QkdNetDevice::SetChannel (Ptr<QkdFiberChannel> ch)
 {
@@ -294,6 +300,14 @@ void QkdNetDevice::SetBasisBias (double pZ)
 { 
   pZ = std::clamp(pZ, 0.05, 0.95); 
   m_pZ_tx = m_pZ_rx = pZ; 
+}
+
+int64_t QkdNetDevice::AssignStreams (int64_t stream) {
+  if (m_u) { m_u->SetStream(stream); }
+  // also reseed std::mt19937 deterministically from 'stream'
+  std::seed_seq seq{ int(stream & 0xffffffff), int((stream>>32)&0xffffffff) };
+  m_rng.seed(seq);
+  return 1; // number of streams consumed (adjust if you add more ns-3 RNGs)
 }
 
 /* ----- Tx path: generate biased bases/bits, call fibre, update stats ---------- */
@@ -2442,12 +2456,14 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     alice->SetChannel(qch); 
     alice->SetLambda(1550.12); 
     alice->SetBasisBias(0.9);
+    alice->AssignStreams(0);  // Assign stream 0 to Alice
 
     Ptr<qkd::QkdNetDevice> bob = CreateObject<qkd::QkdNetDevice>();
     bob->SetNode(usingCsv ? hostByIndex[qDst] : man.host[qDst]);   
     bob->SetChannel(qch);   
     bob->SetLambda(1550.12);   
     bob->SetBasisBias(0.9);
+    bob->AssignStreams(1);    // Assign stream 1 to Bob
 
     // QKD Test Configuration based on mode
     if (enableQkdTesting) {
