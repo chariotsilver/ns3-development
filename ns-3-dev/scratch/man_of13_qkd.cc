@@ -54,6 +54,20 @@ private:
   double ExtraDepol(double lambdaNm) const;                   // Gaussian vs |Δλ|
 };
 
+// QKD: NetDevice (quantum module on a node)
+struct QkdStats { uint32_t nXX=0, nZZ=0, errX=0, errZ=0; double qberX=0.0; };
+
+// QKD: Security helpers (M1 + finite-key estimate)
+inline bool PassesM1(uint32_t nXX, uint32_t N){ return nXX >= (uint32_t)std::ceil(std::log2(std::max(1u,N))); }
+
+inline double Hb(double x){ if(x<=0||x>=1) return 0.0; return -x*std::log2(x)-(1-x)*std::log2(1-x); }
+
+inline uint32_t EstimateSecretBits(uint32_t nZZ, double qberX, double ecEff=1.1){
+  // very simple first cut: nZZ * (1 - ecEff*Hb(qberX)) clamped to 0
+  double s = nZZ * (1.0 - ecEff*Hb(qberX));
+  return (uint32_t) std::max(0.0, s);
+}
+
 // QKD: Key buffer/manager
 class QkdKeyManager {
 public:
@@ -76,7 +90,6 @@ private:
 };
 
 // QKD: NetDevice (quantum module on a node)
-struct QkdStats { uint32_t nXX=0, nZZ=0, errX=0, errZ=0; double qberX=0.0; };
 
 class QkdNetDevice : public NetDevice {
 public:
@@ -86,8 +99,18 @@ public:
   void ReceiveBatch(uint32_t nDetect);          // Rx: measure with bias (stub for now)
   QkdStats GetRollingStats() const { return m_stats; }
   
-  void EndWindow(){ m_key.Update(m_stats.nXX, m_stats.nZZ, m_stats.qberX); m_stats = QkdStats{}; }
+  void EndWindow(){
+    m_last = m_stats;                                    // snapshot window
+    m_key.Update(m_stats.nXX, m_stats.nZZ, m_stats.qberX);
+    m_stats = QkdStats{};                                // reset for next window
+  }
   qkd::QkdKeyManager& Key(){ return m_key; }   // access for printing/consumers
+
+  void SetTxBasisBias(double pZ){ m_pZ_tx = std::clamp(pZ, 0.05, 0.95); }
+  void SetRxBasisBias(double pZ){ m_pZ_rx = std::clamp(pZ, 0.05, 0.95); }
+  std::pair<double,double> GetBiases() const { return {m_pZ_tx, m_pZ_rx}; }
+
+  const QkdStats& LastWindow() const { return m_last; }   // read-only view of last window
 
   // minimal NetDevice overrides used by ns-3 (others can be stubs)
   Ptr<Node> GetNode() const override { return m_node; } void SetNode(Ptr<Node> n) override { m_node=n; }
@@ -119,6 +142,7 @@ private:
   Ptr<QkdFiberChannel> m_ch; Ptr<Node> m_node; ReceiveCallback m_rx;
   double m_lambdaNm=1550.12, m_pZ=0.9, m_baseDepol=0.0;
   QkdStats m_stats;
+  QkdStats m_last;   // snapshot of the previous window's stats
   qkd::QkdKeyManager m_key;     // finite-key buffer
   // NetDevice required members
   uint32_t m_ifIndex=0; Address m_address; uint16_t m_mtu=1500;
@@ -137,17 +161,6 @@ private:
   // helpers:
   void SiftAndUpdate(/* tx/rx buffers here later */);  // updates nXX/nZZ/errX/errZ
 };
-
-// QKD: Security helpers (M1 + finite-key estimate)
-inline bool PassesM1(uint32_t nXX, uint32_t N){ return nXX >= (uint32_t)std::ceil(std::log2(std::max(1u,N))); }
-
-inline double Hb(double x){ if(x<=0||x>=1) return 0.0; return -x*std::log2(x)-(1-x)*std::log2(1-x); }
-
-inline uint32_t EstimateSecretBits(uint32_t nZZ, double qberX, double ecEff=1.1){
-  // very simple first cut: nZZ * (1 - ecEff*Hb(qberX)) clamped to 0
-  double s = nZZ * (1.0 - ecEff*Hb(qberX));
-  return (uint32_t) std::max(0.0, s);
-}
 
 }} // ns3::qkd
 
@@ -1918,6 +1931,12 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     double qkdStart = 1.0, qkdDur = 0.5; 
     uint32_t qkdPps = 5000;  // Reduced from 100k to prevent event loop stress
     
+    // QKD testing parameters
+    bool enableQkdTesting = true;    // Enable comprehensive QKD performance testing
+    uint32_t qkdPulseRate = 80000;   // Higher pulse rate for realistic QKD (80k pulses/10ms = 8MHz)
+    double qkdWindowSec = 0.1;       // 100ms key generation windows
+    std::string qkdTestMode = "load"; // "baseline", "load", "attack", "distance"
+    
     // Best-effort parameters
     std::string beRate = "10Mbps";  // Reduced from 50Mbps to prevent overwhelming
     
@@ -1961,6 +1980,10 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     cmd.AddValue("qkdDur", "QKD window duration (s)", qkdDur);
     cmd.AddValue("qkdPps", "QKD packets per second", qkdPps);
     cmd.AddValue("beRate", "Best-effort data rate", beRate);
+    cmd.AddValue("enableQkdTesting", "Enable comprehensive QKD performance testing", enableQkdTesting);
+    cmd.AddValue("qkdPulseRate", "QKD pulse rate (pulses per 10ms window)", qkdPulseRate);
+    cmd.AddValue("qkdWindowSec", "QKD key generation window duration (seconds)", qkdWindowSec);
+    cmd.AddValue("qkdTestMode", "QKD test mode: baseline|load|attack|distance", qkdTestMode);
     cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets). Applied only if supported in this ns-3 build.", qdiscMaxP);
     cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
     cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
@@ -2402,6 +2425,61 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     bob->SetLambda(1550.12);   
     bob->SetBasisBias(0.9);
 
+    // QKD Test Configuration based on mode
+    if (enableQkdTesting) {
+      std::cout << "=== QKD Performance Testing Mode: " << qkdTestMode << " ===" << std::endl;
+      
+      if (qkdTestMode == "baseline") {
+        // Baseline: minimal classical traffic, ideal conditions
+        std::cout << "Baseline test: minimal classical interference" << std::endl;
+        beRate = "1Mbps";  // Reduce background traffic
+        qkdPulseRate = 100000;  // High pulse rate for max key generation
+        
+      } else if (qkdTestMode == "load") {
+        // Load test: heavy classical traffic to test coexistence
+        std::cout << "Load test: heavy classical traffic coexistence" << std::endl;
+        beRate = "100Mbps";  // High background traffic
+        
+        // Add extra traffic between different host pairs
+        for (uint32_t k = 0; k < numHosts/2; k++) {
+          uint32_t src = k;
+          uint32_t dst = (k + 2) % numHosts;  // Create cross-traffic
+          
+          OnOffHelper extraTraffic("ns3::UdpSocketFactory", 
+                                  InetSocketAddress(ifs.GetAddress(dst), 9001 + k));
+          extraTraffic.SetAttribute("DataRate", StringValue("50Mbps"));
+          extraTraffic.SetAttribute("PacketSize", UintegerValue(1200));
+          extraTraffic.SetAttribute("StartTime", TimeValue(Seconds(0.8 + 0.02*k)));
+          extraTraffic.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1e9]"));
+          extraTraffic.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+          
+          if (usingCsv) {
+            extraTraffic.Install(hostByIndex[src]);
+          } else {
+            extraTraffic.Install(man.host[src]);
+          }
+          
+          PacketSinkHelper extraSink("ns3::UdpSocketFactory", 
+                                   InetSocketAddress(Ipv4Address::GetAny(), 9001 + k));
+          if (usingCsv) {
+            extraSink.Install(hostByIndex[dst]);
+          } else {
+            extraSink.Install(man.host[dst]);
+          }
+        }
+        
+      } else if (qkdTestMode == "attack") {
+        // Attack simulation: intercept-resend, eavesdropping detection
+        std::cout << "Attack test: eavesdropping detection" << std::endl;
+        // We'll add channel loss/error injection
+        
+      } else if (qkdTestMode == "distance") {
+        // Distance test: varying fiber length and loss
+        std::cout << "Distance test: long-distance QKD performance" << std::endl;
+        // Configure higher loss, longer fiber
+      }
+    }
+
     // simple traffic: send batches every 10 ms
     Simulator::ScheduleNow([alice]{ alice->SendBatch(5000); });
     Simulator::Schedule(Seconds(0.01), [](){ /* repeat with EventId if you want periodic */ });
@@ -2413,27 +2491,73 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
       std::cout << "Alice QKD test: nXX=" << stats.nXX
                 << " nZZ=" << stats.nZZ 
                 << " QBER_X=" << stats.qberX << std::endl;
+      
+      // Test new bias control functionality
+      alice->SetTxBasisBias(0.8);
+      alice->SetRxBasisBias(0.7);
+      auto biases = alice->GetBiases();
+      std::cout << "Bias test: Tx=" << biases.first << " Rx=" << biases.second << std::endl;
+      
+      // Test EndWindow and LastWindow functionality
+      alice->EndWindow();
+      auto lastWindow = alice->LastWindow();
+      std::cout << "Last window: nXX=" << lastWindow.nXX << " nZZ=" << lastWindow.nZZ 
+                << " QBER=" << lastWindow.qberX << std::endl;
+      std::cout << "Key buffer: " << alice->Key().Buffer() << " bits, healthy=" 
+                << (alice->Key().Healthy() ? "Y" : "N") << std::endl;
     });
 
-    // --- QKD: simple driver (periodic batches + window close) ---------------------
-    auto batchPeriod = MilliSeconds(10);
-    auto windowPeriod = MilliSeconds(100);
+    // --- QKD: Enhanced driver with realistic testing modes ---------------------
+    auto batchPeriod = MilliSeconds(10);  // 10ms batch period for realistic timing
+    auto windowPeriod = MilliSeconds(qkdWindowSec * 1000);  // Configurable window period
 
-    // repeat sender
+    // QKD performance tracking (shared_ptr for lambda capture)
+    auto totalKeyBits = std::make_shared<uint32_t>(0);
+    auto totalWindows = std::make_shared<uint32_t>(0);
+    auto avgQber = std::make_shared<double>(0.0);
+    auto failedWindows = std::make_shared<uint32_t>(0);
+
+    // Repeat sender with configurable pulse rate
     EventId sendEvt;
     std::function<void()> sendFn = [&](){
-      alice->SendBatch(8000);  // ~8k pulses per 10 ms → 800 kpps; tune as needed
+      alice->SendBatch(qkdPulseRate);  // Use configurable pulse rate
       sendEvt = Simulator::Schedule(batchPeriod, sendFn);
     };
     sendFn();
 
-    // window close + stats print
+    // Window close + enhanced stats with performance analysis
     EventId winEvt;
-    std::function<void()> winFn = [&](){
+    std::function<void()> winFn = [&, totalKeyBits, totalWindows, avgQber, failedWindows](){
       alice->EndWindow();
-      std::cout << "QKD window: bits+=" << alice->Key().LastWindowBits()
-                << " buf=" << alice->Key().Buffer()
-                << " healthy=" << (alice->Key().Healthy() ? "Y" : "N") << std::endl;
+      auto lastWindow = alice->LastWindow();
+      uint32_t windowBits = alice->Key().LastWindowBits();
+      bool healthy = alice->Key().Healthy();
+      
+      (*totalWindows)++;
+      if (healthy) {
+        *totalKeyBits += windowBits;
+        *avgQber = (*avgQber * (*totalWindows - *failedWindows - 1) + lastWindow.qberX) / (*totalWindows - *failedWindows);
+      } else {
+        (*failedWindows)++;
+      }
+      
+      // Enhanced logging for QKD testing
+      if (enableQkdTesting) {
+        std::cout << "[QKD-" << qkdTestMode << "] Window " << *totalWindows 
+                  << ": bits+=" << windowBits 
+                  << " buf=" << alice->Key().Buffer()
+                  << " healthy=" << (healthy ? "Y" : "N")
+                  << " QBER=" << std::fixed << std::setprecision(4) << lastWindow.qberX
+                  << " nXX=" << lastWindow.nXX << " nZZ=" << lastWindow.nZZ
+                  << " success_rate=" << std::setprecision(2) << (100.0 * (*totalWindows - *failedWindows) / *totalWindows) << "%"
+                  << std::endl;
+      } else {
+        std::cout << "QKD window: bits+=" << windowBits
+                  << " buf=" << alice->Key().Buffer()
+                  << " healthy=" << (healthy ? "Y" : "N")
+                  << " lastWin(nXX=" << lastWindow.nXX << ",nZZ=" << lastWindow.nZZ << ")" << std::endl;
+      }
+      
       winEvt = Simulator::Schedule(windowPeriod, winFn);
     };
     winFn();
@@ -2536,6 +2660,44 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     std::cout << "\n";
     std::cout << "Total BE RX: " << totalBeRx << " bytes\n";
     std::cout << "QKD control RX (host" << qSrc << "→host" << qDst << "): " << qctrlRx << " bytes\n";
+    
+    // QKD Performance Summary
+    if (enableQkdTesting) {
+      std::cout << "\n=== QKD Performance Summary (" << qkdTestMode << " mode) ===" << std::endl;
+      double simTime = (enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : 15.0));
+      double keyRate = *totalKeyBits / simTime;  // bits per second
+      double successRate = *totalWindows > 0 ? 100.0 * (*totalWindows - *failedWindows) / *totalWindows : 0.0;
+      
+      std::cout << "Simulation duration: " << simTime << "s" << std::endl;
+      std::cout << "Total key bits generated: " << *totalKeyBits << " bits" << std::endl;
+      std::cout << "Average key rate: " << std::fixed << std::setprecision(1) << keyRate << " bps" << std::endl;
+      std::cout << "Window success rate: " << std::setprecision(2) << successRate << "% (" 
+                << (*totalWindows - *failedWindows) << "/" << *totalWindows << ")" << std::endl;
+      std::cout << "Average QBER: " << std::setprecision(4) << *avgQber << std::endl;
+      std::cout << "Final key buffer: " << alice->Key().Buffer() << " bits" << std::endl;
+      
+      // Performance assessment
+      if (keyRate > 1000) {
+        std::cout << "Performance: EXCELLENT (>1kbps)" << std::endl;
+      } else if (keyRate > 100) {
+        std::cout << "Performance: GOOD (>100bps)" << std::endl;
+      } else if (keyRate > 10) {
+        std::cout << "Performance: ACCEPTABLE (>10bps)" << std::endl;
+      } else {
+        std::cout << "Performance: POOR (<10bps)" << std::endl;
+      }
+      
+      if (*avgQber < 0.02) {
+        std::cout << "Security: EXCELLENT (QBER < 2%)" << std::endl;
+      } else if (*avgQber < 0.05) {
+        std::cout << "Security: GOOD (QBER < 5%)" << std::endl;
+      } else if (*avgQber < 0.11) {
+        std::cout << "Security: MARGINAL (QBER < 11%)" << std::endl;
+      } else {
+        std::cout << "Security: COMPROMISED (QBER >= 11%)" << std::endl;
+      }
+      std::cout << "=========================================" << std::endl;
+    }
     
     Simulator::Destroy();
     return 0;
