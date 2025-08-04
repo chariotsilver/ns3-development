@@ -29,8 +29,10 @@
 #include <atomic>
 #include <random>      // std::mt19937, std::binomial_distribution
 #include <cmath>       // std::ceil, std::log2
+#include <nlohmann/json.hpp>
 
 using namespace ns3;
+using nlohmann::json;
 
 // QKD: Fiber channel (shared span, WDM-aware)
 namespace ns3 { namespace qkd {
@@ -475,33 +477,40 @@ public:
   }
   void Close(){ if (m_fd!=-1){ ::close(m_fd); m_fd=-1; } }
 
-  bool SendObs(const Obs& o){
-    if (m_fd==-1) return false;
-    // minimal JSON (no deps). Values are safe; no quoting needed.
-    std::ostringstream ss;
-    ss << "{\"src\":"<<o.src<<",\"dst\":"<<o.dst
-       <<",\"nXX\":"<<o.nXX<<",\"nZZ\":"<<o.nZZ
-       <<",\"qberX\":"<<o.qberX<<",\"keyBuf\":"<<o.keyBuf
-       <<",\"pZtx\":"<<o.pZtx<<",\"lastBits\":"<<o.lastBits
-       <<",\"winSec\":"<<o.winSec<<"}\n";
-    auto s = ss.str();
-    return ::send(m_fd, s.data(), s.size(), 0) == (ssize_t)s.size();
+  bool SendObs(const Obs& o) {
+    if (m_fd == -1) return false;
+    json j = {
+      {"src", o.src}, {"dst", o.dst},
+      {"nXX", o.nXX}, {"nZZ", o.nZZ},
+      {"qberX", o.qberX}, {"keyBuf", o.keyBuf},
+      {"pZtx", o.pZtx}, {"lastBits", o.lastBits},
+      {"winSec", o.winSec}
+    };
+    auto s = j.dump(); s.push_back('\n');
+    return ::send(m_fd, s.data(), s.size(), 0) == (ssize_t) s.size();
   }
 
-  bool TryRecvAct(Act& a){
-    if (m_fd==-1) return false;
-    char buf[256]; int n = ::recv(m_fd, buf, sizeof(buf)-1, 0);
+  bool TryRecvAct(Act& a) {
+    if (m_fd == -1) return false;
+    char buf[512]; int n = ::recv(m_fd, buf, sizeof(buf)-1, 0);
     if (n <= 0) return false;
     buf[n] = 0;
-    // Expect something like: {"pZ":0.87}\n (very lenient parse)
-    const char* p = std::strstr(buf, "\"pZ\"");
-    if (!p) return false;
-    double val = 0.0;
-    if (std::sscanf(p, "\"pZ\"%*[^0-9.-]%lf", &val) == 1){
-      a.hasPz = true; a.pZ = std::clamp(val, 0.05, 0.95);
-      return true;
+    // handle possibly multiple lines
+    std::istringstream ss{std::string(buf)};
+    std::string line;
+    bool applied = false;
+    while (std::getline(ss, line)) {
+      if (line.empty()) continue;
+      try {
+        json j = json::parse(line);
+        if (j.contains("pZ")) {
+          a.hasPz = true;
+          a.pZ = std::clamp(j.at("pZ").get<double>(), 0.05, 0.95);
+          applied = true;
+        }
+      } catch (...) { /* ignore malformed lines */ }
     }
-    return false;
+    return applied;
   }
 
   ~MlBridge(){ Close(); }
