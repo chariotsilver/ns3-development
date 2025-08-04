@@ -158,6 +158,9 @@ private:
   // RNG for batch sampling (can be replaced with ns-3 streams later)
   std::mt19937 m_rng { 0xC0FFEE }; // deterministic seed; switch to AssignStreams later
   
+  // Attachment tracking to prevent double-attach
+  bool m_attached = false;
+  
   // helpers:
   void SiftAndUpdate(/* tx/rx buffers here later */);  // updates nXX/nZZ/errX/errZ
 };
@@ -267,13 +270,19 @@ QkdNetDevice::QkdNetDevice () {}
 void QkdNetDevice::SetChannel (Ptr<QkdFiberChannel> ch)
 {
   m_ch = ch;
-  if (m_ch && m_lambdaNm > 0.0) m_ch->Attach (this, m_lambdaNm);
+  if (m_ch && !m_attached && m_lambdaNm > 0.0) { 
+    m_ch->Attach (this, m_lambdaNm); 
+    m_attached = true; 
+  }
 }
 
 void QkdNetDevice::SetLambda (double nm)
 {
   m_lambdaNm = nm;
-  if (m_ch) m_ch->Attach (this, m_lambdaNm);           // safe double-attach is fine
+  if (m_ch && !m_attached) { 
+    m_ch->Attach (this, m_lambdaNm); 
+    m_attached = true; 
+  }
 }
 
 void QkdNetDevice::SetBasisBias (double pZ) 
