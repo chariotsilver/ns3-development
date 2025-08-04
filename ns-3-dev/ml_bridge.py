@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Minimal Python ML Bridge for NS-3 QKD Bias Controller
+SKR-Optimizing ML Bridge for NS-3 QKD Controller
 
-Purpose: Quick test policy that targets 10% X-ratio by nudging pZ.
+Purpose: Hill-climbing policy that maximizes Secret Key Rate (SKR) by adjusting pZ.
 Usage: python ml_bridge.py
 
 The ML bridge receives observation JSON from NS-3 and responds with action JSON.
-Observation format: {"nXX": int, "nZZ": int, "pZtx": float, "sessionId": string}
+Observation format: {"src": int, "dst": int, "nXX": int, "nZZ": int, "qberX": float, 
+                     "keyBuf": int, "pZtx": float, "lastBits": int, "winSec": float}
 Action format: {"pZ": float}
 
-This toy policy pushes pZ toward 1 - rX_target (since rX ~ (1-pZ))
+This policy optimizes SKR (bits/sec) using a simple hill-climber on pZ.
+If M1 fails, lastBits=0, naturally pushing search away from too-high pZ.
 """
 
 import json
@@ -24,7 +26,7 @@ def serve(port=5557):
     Args:
         port (int): TCP port to listen on (default 5557)
     """
-    print(f"Starting ML bridge server on localhost:{port}")
+    print(f"Starting SKR-optimizing ML bridge server on localhost:{port}")
     
     # Create and configure socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -41,6 +43,9 @@ def serve(port=5557):
         
         buf = b""
         observation_count = 0
+        
+        # Global state for hill-climbing across observations
+        state = {"pz": 0.9, "best_skr": -1.0, "step": 0.05}
         
         while True:
             # Receive data from NS-3
@@ -62,28 +67,39 @@ def serve(port=5557):
                     
                     print(f"Observation {observation_count}: {obs}")
                     
-                    # Extract key metrics
-                    n_total = max(1, obs.get("nXX", 0) + obs.get("nZZ", 0))
-                    rX_actual = obs.get("nXX", 0) / n_total
-                    pZ_current = obs.get("pZtx", 0.8)
-                    session_id = obs.get("sessionId", "unknown")
+                    # Extract SKR signals
+                    win_bits = obs.get("lastBits", 0)
+                    win_sec = max(1e-6, obs.get("winSec", 0.1))
+                    skr = win_bits / win_sec  # bits per second
                     
-                    # Toy ML policy: target 10% X-ratio
-                    rX_target = 0.10
+                    pz_current = obs.get("pZtx", 0.9)
+                    session_id = f"{obs.get('src', 0)}->{obs.get('dst', 1)}"
                     
-                    # Since rX ~ (1-pZ), we adjust pZ to reach target
-                    # Use proportional control with gain 0.08
-                    gain = 0.08
-                    error = rX_target - rX_actual
-                    pZ_new = pZ_current - gain * error
+                    # Hill-climbing SKR optimization
+                    cur_pz = state["pz"]
+                    cur_best = state["best_skr"]
+                    step = state["step"]
                     
-                    # Clamp pZ to safe bounds
-                    pZ_new = max(0.05, min(0.95, pZ_new))
+                    # If we improved, keep direction; else try the other side and shrink step
+                    if skr > cur_best:
+                        cur_best = skr
+                        # keep moving same direction next time
+                        print(f"  Session {session_id}: SKR improved! {cur_best:.1f}->{skr:.1f} bps, keeping direction")
+                    else:
+                        step = max(0.01, 0.5 * step)  # shrink step if no improvement
+                        step = -step                  # flip direction
+                        print(f"  Session {session_id}: No improvement, flipping direction, step={step:.3f}")
+                    
+                    # Calculate new pZ
+                    new_pz = max(0.05, min(0.95, cur_pz + step))
+                    
+                    # Update state
+                    state.update({"pz": new_pz, "best_skr": max(cur_best, skr), "step": step})
                     
                     # Create action response
-                    action = {"pZ": pZ_new}
+                    action = {"pZ": new_pz}
                     
-                    print(f"  Session {session_id}: rX={rX_actual:.4f} target={rX_target:.4f} pZ: {pZ_current:.4f}->{pZ_new:.4f}")
+                    print(f"  Session {session_id}: SKR={skr:.1f} bps, best={state['best_skr']:.1f} bps, pZ: {pz_current:.4f}->{new_pz:.4f}")
                     
                     # Send action back to NS-3
                     response = json.dumps(action).encode() + b"\n"

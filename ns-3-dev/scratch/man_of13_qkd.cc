@@ -442,6 +442,8 @@ struct Obs {
   double   qberX;         // last-window QBER_X
   uint32_t keyBuf;        // buffered secret bits for this pair
   double   pZtx;          // current transmitter bias
+  uint32_t lastBits;      // secret bits produced in last window (post M1 & finite-key)
+  double   winSec;        // window duration in seconds
 };
 struct Act {
   bool     hasPz = false; // if true, apply pZ
@@ -480,7 +482,8 @@ public:
     ss << "{\"src\":"<<o.src<<",\"dst\":"<<o.dst
        <<",\"nXX\":"<<o.nXX<<",\"nZZ\":"<<o.nZZ
        <<",\"qberX\":"<<o.qberX<<",\"keyBuf\":"<<o.keyBuf
-       <<",\"pZtx\":"<<o.pZtx<<"}\n";
+       <<",\"pZtx\":"<<o.pZtx<<",\"lastBits\":"<<o.lastBits
+       <<",\"winSec\":"<<o.winSec<<"}\n";
     auto s = ss.str();
     return ::send(m_fd, s.data(), s.size(), 0) == (ssize_t)s.size();
   }
@@ -563,6 +566,8 @@ private:
         ob.nZZ = v.nZZ; 
         ob.qberX = v.qberX; 
         ob.keyBuf = v.buf;
+        ob.lastBits = v.lastBits;  // secret bits produced in last window
+        ob.winSec = m_T.GetSeconds();  // window duration in seconds
         auto [pZtx, pZrx] = p.tx->GetBiases(); 
         ob.pZtx = pZtx;
 
