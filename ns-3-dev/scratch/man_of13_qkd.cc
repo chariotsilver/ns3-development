@@ -18,8 +18,10 @@
 #include <set>
 #include <map>
 #include <iostream>
+#include <iomanip>
 #include <numeric>
 #include <memory>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
@@ -32,6 +34,9 @@ using namespace ns3;
 
 // QKD: Fiber channel (shared span, WDM-aware)
 namespace ns3 { namespace qkd {
+
+// Forward declarations
+class QkdKeyManager;
 
 class QkdFiberChannel : public Channel {
 public:
@@ -49,6 +54,27 @@ private:
   double ExtraDepol(double lambdaNm) const;                   // Gaussian vs |Δλ|
 };
 
+// QKD: Key buffer/manager
+class QkdKeyManager {
+public:
+  void Update(const QkdStats& s, uint32_t N){
+    if (PassesM1(s.nXX, N)) { m_lastBits = EstimateSecretBits(s.nZZ, s.qberX); m_ok=true; }
+    else { m_lastBits = 0; m_ok=false; }
+    m_buf += m_lastBits;
+  }
+  void Update(uint32_t nXX, uint32_t nZZ, double qberX){
+    uint32_t N = nXX + nZZ;
+    if (PassesM1(nXX, N)) { m_lastBits = EstimateSecretBits(nZZ, qberX); m_ok = true; }
+    else                  { m_lastBits = 0;                                  m_ok = false; }
+    m_buf += m_lastBits;
+  }
+  uint32_t Drain(uint32_t want){ uint32_t g=std::min(want,m_buf); m_buf-=g; return g; }
+  uint32_t Buffer() const { return m_buf; } bool Healthy() const { return m_ok; }
+  uint32_t LastWindowBits() const { return m_lastBits; }
+private:
+  uint32_t m_buf=0, m_lastBits=0; bool m_ok=false;
+};
+
 // QKD: NetDevice (quantum module on a node)
 struct QkdStats { uint32_t nXX=0, nZZ=0, errX=0, errZ=0; double qberX=0.0; };
 
@@ -59,6 +85,9 @@ public:
   void SendBatch(uint32_t nPulses);             // Tx: prepare bases/bits with bias and emit
   void ReceiveBatch(uint32_t nDetect);          // Rx: measure with bias (stub for now)
   QkdStats GetRollingStats() const { return m_stats; }
+  
+  void EndWindow(){ m_key.Update(m_stats.nXX, m_stats.nZZ, m_stats.qberX); m_stats = QkdStats{}; }
+  qkd::QkdKeyManager& Key(){ return m_key; }   // access for printing/consumers
 
   // minimal NetDevice overrides used by ns-3 (others can be stubs)
   Ptr<Node> GetNode() const override { return m_node; } void SetNode(Ptr<Node> n) override { m_node=n; }
@@ -90,6 +119,7 @@ private:
   Ptr<QkdFiberChannel> m_ch; Ptr<Node> m_node; ReceiveCallback m_rx;
   double m_lambdaNm=1550.12, m_pZ=0.9, m_baseDepol=0.0;
   QkdStats m_stats;
+  qkd::QkdKeyManager m_key;     // finite-key buffer
   // NetDevice required members
   uint32_t m_ifIndex=0; Address m_address; uint16_t m_mtu=1500;
   
@@ -118,20 +148,6 @@ inline uint32_t EstimateSecretBits(uint32_t nZZ, double qberX, double ecEff=1.1)
   double s = nZZ * (1.0 - ecEff*Hb(qberX));
   return (uint32_t) std::max(0.0, s);
 }
-
-// QKD: Key buffer/manager
-class QkdKeyManager {
-public:
-  void Update(const QkdStats& s, uint32_t N){
-    if (PassesM1(s.nXX, N)) { m_lastBits = EstimateSecretBits(s.nZZ, s.qberX); m_ok=true; }
-    else { m_lastBits = 0; m_ok=false; }
-    m_buf += m_lastBits;
-  }
-  uint32_t Drain(uint32_t want){ uint32_t g=std::min(want,m_buf); m_buf-=g; return g; }
-  uint32_t Buffer() const { return m_buf; } bool Healthy() const { return m_ok; }
-private:
-  uint32_t m_buf=0, m_lastBits=0; bool m_ok=false;
-};
 
 }} // ns3::qkd
 
@@ -351,22 +367,22 @@ public:
       ? ("Link_" + std::to_string(linkId)) : description;
     m_linkStates[linkId] = true; // Initially operational
     
-    NS_LOG_INFO("LinkFailureModule: Registered link " << linkId 
-                << " (" << m_linkDescriptions[linkId] << ")");
+    std::cout << "LinkFailureModule: Registered link " << linkId 
+              << " (" << m_linkDescriptions[linkId] << ")" << std::endl;
   }
 
   void ScheduleRealisticFailures() {
     if (!m_enableFailures) {
-      NS_LOG_INFO("LinkFailureModule: Failure simulation disabled");
+      std::cout << "LinkFailureModule: Failure simulation disabled" << std::endl;
       return;
     }
 
     if (m_coreLinks.size() < 4) {
-      NS_LOG_WARN("LinkFailureModule: Need at least 4 links for realistic failure scenarios");
+      std::cout << "LinkFailureModule: Need at least 4 links for realistic failure scenarios" << std::endl;
       return;
     }
 
-    NS_LOG_INFO("LinkFailureModule: Scheduling realistic failure scenarios...");
+    std::cout << "LinkFailureModule: Scheduling realistic failure scenarios..." << std::endl;
 
     // Scenario 1: Fiber cut simulation (complete failure)
     ScheduleEvent({
@@ -438,7 +454,7 @@ public:
       });
     }
 
-    NS_LOG_INFO("LinkFailureModule: Scheduled " << m_scheduledEvents.size() << " failure events");
+    std::cout << "LinkFailureModule: Scheduled " << m_scheduledEvents.size() << " failure events" << std::endl;
   }
 
   void PrintFailureSummary() {
@@ -469,7 +485,7 @@ private:
   void ExecuteFailureEvent(const LinkFailureEvent& event) {
     auto linkIt = m_coreLinks.find(event.linkId);
     if (linkIt == m_coreLinks.end()) {
-      NS_LOG_ERROR("LinkFailureModule: Link " << event.linkId << " not found");
+      std::cerr << "LinkFailureModule: Link " << event.linkId << " not found" << std::endl;
       return;
     }
 
@@ -505,7 +521,7 @@ private:
 
   void FailLink(NetDeviceContainer& link, uint32_t linkId, const std::string& reason) {
     if (!m_linkStates[linkId]) {
-      NS_LOG_DEBUG("LinkFailureModule: Link " << linkId << " already failed");
+      // Debug: Link already failed - skipping
       return;
     }
 
@@ -523,8 +539,8 @@ private:
 
     m_linkStates[linkId] = false;
 
-    NS_LOG_WARN("LinkFailureModule: FAILED link " << linkId 
-                << " (" << m_linkDescriptions[linkId] << ") - " << reason);
+    std::cout << "LinkFailureModule: FAILED link " << linkId 
+              << " (" << m_linkDescriptions[linkId] << ") - " << reason << std::endl;
 
     // Notify controller about link state change
     NotifyController(linkId, false);
@@ -532,7 +548,7 @@ private:
 
   void RestoreLink(NetDeviceContainer& link, uint32_t linkId, const std::string& reason) {
     if (m_linkStates[linkId]) {
-      NS_LOG_DEBUG("LinkFailureModule: Link " << linkId << " already operational");
+      // Debug: Link already operational - skipping
       return;
     }
 
@@ -555,16 +571,16 @@ private:
 
     m_linkStates[linkId] = true;
 
-    NS_LOG_INFO("LinkFailureModule: RESTORED link " << linkId 
-                << " (" << m_linkDescriptions[linkId] << ") - " << reason);
+    std::cout << "LinkFailureModule: RESTORED link " << linkId 
+              << " (" << m_linkDescriptions[linkId] << ") - " << reason << std::endl;
 
     // Notify controller about link restoration
     NotifyController(linkId, true);
   }
 
   void DegradeLink(NetDeviceContainer& link, uint32_t linkId, double lossRate, double additionalDelay) {
-    NS_LOG_INFO("LinkFailureModule: DEGRADING link " << linkId 
-                << " loss=" << lossRate << " delay=+" << additionalDelay << "ms");
+    std::cout << "LinkFailureModule: DEGRADING link " << linkId 
+              << " loss=" << lossRate << " delay=+" << additionalDelay << "ms" << std::endl;
 
     // Add packet loss error model
     Ptr<RateErrorModel> errorModel0 = CreateObject<RateErrorModel>();
@@ -605,8 +621,8 @@ private:
                  << "," << m_linkDescriptions[linkId] 
                  << ",0,0\n";
 
-    NS_LOG_INFO("LinkFailureModule: Notified controller - Link " << linkId 
-                << " status: " << status);
+    std::cout << "LinkFailureModule: Notified controller - Link " << linkId 
+              << " status: " << status << std::endl;
   }
 
   void LogFailureEvent(const LinkFailureEvent& event) {
@@ -2398,6 +2414,47 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
                 << " nZZ=" << stats.nZZ 
                 << " QBER_X=" << stats.qberX << std::endl;
     });
+
+    // --- QKD: simple driver (periodic batches + window close) ---------------------
+    auto batchPeriod = MilliSeconds(10);
+    auto windowPeriod = MilliSeconds(100);
+
+    // repeat sender
+    EventId sendEvt;
+    std::function<void()> sendFn = [&](){
+      alice->SendBatch(8000);  // ~8k pulses per 10 ms → 800 kpps; tune as needed
+      sendEvt = Simulator::Schedule(batchPeriod, sendFn);
+    };
+    sendFn();
+
+    // window close + stats print
+    EventId winEvt;
+    std::function<void()> winFn = [&](){
+      alice->EndWindow();
+      std::cout << "QKD window: bits+=" << alice->Key().LastWindowBits()
+                << " buf=" << alice->Key().Buffer()
+                << " healthy=" << (alice->Key().Healthy() ? "Y" : "N") << std::endl;
+      winEvt = Simulator::Schedule(windowPeriod, winFn);
+    };
+    winFn();
+
+    // Optional: feed classical load into the fibre (if you have Mbps)
+    // Example: inject classical traffic load for Raman/crosstalk simulation
+    Simulator::Schedule(Seconds(2.0), [qch](){
+      double mbps = 1000.0;  // Example: 1 Gbps classical traffic
+      qch->UpdateClassicalLoad(1530.0, mbps);  // λ_classical = 1530 nm
+      std::cout << "Classical load: " << mbps << " Mbps at 1530 nm injected" << std::endl;
+    });
+    
+    // Periodic classical load updates (simulate varying traffic)
+    EventId classicalEvt;
+    std::function<void()> classicalFn = [&](){
+      // Simulate varying classical traffic (500-2000 Mbps)
+      double mbps = 500.0 + (std::rand() % 1500);  // Random load 500-2000 Mbps
+      qch->UpdateClassicalLoad(1530.0, mbps);
+      classicalEvt = Simulator::Schedule(Seconds(1.0), classicalFn);  // Update every second
+    };
+    Simulator::Schedule(Seconds(5.0), classicalFn);  // Start after 5 seconds
 
     // Controller
     Ptr<ControllerApp> qkdCtrl = CreateObject<ControllerApp>();
