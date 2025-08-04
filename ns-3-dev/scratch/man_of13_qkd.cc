@@ -89,6 +89,16 @@ private:
   uint32_t m_buf=0, m_lastBits=0; bool m_ok=false;
 };
 
+// --- QKD: Classical load probe (call this with your measured Mbps) -----------
+class ClassicalLoadProbe {
+public:
+  ClassicalLoadProbe(Ptr<QkdFiberChannel> ch, double lambdaNm) : m_ch(ch), m_lambda(lambdaNm) {}
+  void Report(double mbps) { if (m_ch) m_ch->UpdateClassicalLoad(m_lambda, mbps); }
+private:
+  Ptr<QkdFiberChannel> m_ch; 
+  double m_lambda;
+};
+
 // QKD: NetDevice (quantum module on a node)
 
 class QkdNetDevice : public NetDevice {
@@ -1738,6 +1748,44 @@ private:
   }
   std::vector<Ptr<qkd::QkdNetDevice>> m_devs; Time m_T=Seconds(0.5);
 };
+
+// Classical Load Monitor Application
+class ClassicalLoadMonitor : public Application {
+public:
+  ClassicalLoadMonitor(qkd::ClassicalLoadProbe* probe) : m_probe(probe), m_counter(0) {}
+  void SetMonitoringPeriod(Time period) { m_period = period; }
+  
+  void StartApplication() override {
+    // Start monitoring after 1 second delay
+    Simulator::Schedule(Seconds(1.0), &ClassicalLoadMonitor::Monitor, this);
+  }
+  
+  void StopApplication() override {
+    Simulator::Cancel(m_event);
+  }
+  
+private:
+  void Monitor() {
+    if (m_probe) {
+      // Simulate varying classical traffic load (20-100 Mbps)
+      // In a real implementation, this would sample actual interface throughput
+      double baseLoad = 50.0;
+      double variation = 30.0 * std::sin(m_counter * 0.1); // Sinusoidal variation
+      double currentLoad = std::max(20.0, baseLoad + variation);
+      
+      m_probe->Report(currentLoad);
+      m_counter++;
+      
+      // Schedule next monitoring event
+      m_event = Simulator::Schedule(m_period, &ClassicalLoadMonitor::Monitor, this);
+    }
+  }
+  
+  qkd::ClassicalLoadProbe* m_probe;
+  Time m_period = MilliSeconds(100); // Default 100ms monitoring
+  EventId m_event;
+  uint32_t m_counter;
+};
 } // ns3
 
 // QKD: ML bridge placeholders (replace with ZMQ/gRPC later)
@@ -2464,6 +2512,20 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     bob->SetLambda(1550.12);   
     bob->SetBasisBias(0.9);
     bob->AssignStreams(1);    // Assign stream 1 to Bob
+
+    // --- Classical Load Monitoring Setup ---
+    // Create classical load probe to monitor traffic and feed into QKD channel
+    qkd::ClassicalLoadProbe classicalProbe(qch, 1530.0); // 1530 nm classical wavelength
+    
+    // Create and install classical load monitoring application
+    Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
+    loadMonitor->SetMonitoringPeriod(MilliSeconds(100)); // Monitor every 100ms
+    
+    // Install on the same node as Alice (or any node - it's just monitoring)
+    Ptr<Node> monitorNode = usingCsv ? hostByIndex[qSrc] : man.host[qSrc];
+    monitorNode->AddApplication(loadMonitor);
+    loadMonitor->SetStartTime(Seconds(0.5));
+    loadMonitor->SetStopTime(Seconds(20.0)); // Monitor for the simulation duration
 
     // QKD Test Configuration based on mode
     if (enableQkdTesting) {
