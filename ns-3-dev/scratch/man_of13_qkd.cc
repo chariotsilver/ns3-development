@@ -528,27 +528,22 @@ public:
   void SetPeriod(Time t) { m_T = t; }          // align with your window
   void SetTargetX(double r) { m_rX = std::clamp(r, 0.05, 0.3); }
   void SetGain(double k) { m_k = std::clamp(k, 0.01, 0.5); }
-  void SetDynamicTuning(bool enable) { m_dynamicTuning = enable; }
-  void SetMlBridge(const std::string& host, uint16_t port) { 
-    m_mlHost = host; m_mlPort = port; m_useMl = true; 
+  
+  // New ML Bridge and Dynamic Control API
+  void EnableDynamicBias(bool on) { m_dynamicBias = on; }
+  bool ConnectMl(const std::string& host, uint16_t port) { 
+    m_mlConnected = m_ml.Connect(host, port); 
+    return m_mlConnected; 
   }
 
 protected:
   void StartApplication() override { 
-    if (m_useMl) {
-      if (m_bridge.Connect(m_mlHost, m_mlPort)) {
-        std::cout << "ML Bridge connected to " << m_mlHost << ":" << m_mlPort << std::endl;
-      } else {
-        std::cout << "ML Bridge connection failed, continuing without ML" << std::endl;
-        m_useMl = false;
-      }
-    }
     m_evt = Simulator::Schedule(m_T, &QkdBiasController::Tick, this); 
   }
   
   void StopApplication() override { 
     if (m_evt.IsRunning()) m_evt.Cancel();
-    if (m_useMl) m_bridge.Close();
+    if (m_mlConnected) m_ml.Close();
   }
 
 private:
@@ -559,42 +554,40 @@ private:
       const double matched = double(v.nXX + v.nZZ);
       if (matched > 0) {
         const double rX = double(v.nXX) / matched;
-        auto biases = p.tx->GetBiases();
         
-        // Send observation to ML bridge if enabled
-        if (m_useMl) {
-          qkd::Obs obs;
-          obs.src = p.sid.src;
-          obs.dst = p.sid.dst;
-          obs.nXX = v.nXX;
-          obs.nZZ = v.nZZ;
-          obs.qberX = v.qberX;
-          obs.keyBuf = v.buf;  // Use 'buf' from SessionView
-          obs.pZtx = biases.first;
-          
-          if (m_bridge.SendObs(obs)) {
-            // Try to receive action from ML
-            qkd::Act act;
-            if (m_bridge.TryRecvAct(act) && act.hasPz) {
-              double pZnew = std::clamp(act.pZ, 0.05, 0.95);
-              p.tx->SetTxBasisBias(pZnew);
-              std::cout << "ML BiasController: Session " << p.sid.src << "->" << p.sid.dst 
-                        << " rX=" << rX << " ML_pZ=" << pZnew << std::endl;
-              continue; // Skip internal control if ML provided action
-            }
-          }
+        // Build obs per pair and talk to ML
+        qkd::Obs ob;
+        ob.src = p.sid.src; 
+        ob.dst = p.sid.dst;
+        ob.nXX = v.nXX; 
+        ob.nZZ = v.nZZ; 
+        ob.qberX = v.qberX; 
+        ob.keyBuf = v.buf;
+        auto [pZtx, pZrx] = p.tx->GetBiases(); 
+        ob.pZtx = pZtx;
+
+        if (m_mlConnected) { 
+          m_ml.SendObs(ob); 
         }
-        
-        // Internal proportional control (if dynamic tuning enabled and no ML action)
-        if (m_dynamicTuning) {
-          double pZnew = std::clamp(biases.first - m_k * (m_rX - rX), 0.05, 0.95);
+
+        qkd::Act act;
+        bool haveAct = m_mlConnected && m_ml.TryRecvAct(act);
+
+        if (!m_dynamicBias) {
+          // static mode: keep whatever pZ is (or set once from a param)
+        } else if (haveAct && act.hasPz) {
+          p.tx->SetTxBasisBias(act.pZ);                // apply ML's pZ
+          std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
+                    << " rX=" << rX << " ML pZ: " << pZtx << "->" << act.pZ << std::endl;
+        } else {
+          // fallback: proportional servo to hold X ratio
+          double pZnew = std::clamp(pZtx - m_k * (m_rX - rX), 0.05, 0.95);
           p.tx->SetTxBasisBias(pZnew);
-          
           std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
                     << " rX=" << rX << " target=" << m_rX 
-                    << " pZ: " << biases.first << "->" << pZnew << std::endl;
+                    << " pZ: " << pZtx << "->" << pZnew << std::endl;
         }
-                     
+        
         // TODO route hook: ProgramRoute(p.sid, /*path*/);
       }
     }
@@ -617,12 +610,12 @@ private:
   qkd::SessionManager* m_sm = nullptr;
   Time m_T = MilliSeconds(100); 
   double m_rX = 0.10, m_k = 0.08; 
-  bool m_dynamicTuning = true;
-  bool m_useMl = false;
-  std::string m_mlHost = "127.0.0.1";
-  uint16_t m_mlPort = 8888;
-  qkd::MlBridge m_bridge;
   EventId m_evt;
+  
+  // ML Bridge and Dynamic Control
+  bool m_dynamicBias = true;                 // ON/OFF switch (simulation parameter)
+  qkd::MlBridge m_ml;                        // ML socket
+  bool m_mlConnected = false;
 };
 } // namespace ns3
 
@@ -2320,7 +2313,7 @@ private:
     cmd.AddValue("maxPaths", "Maximum number of paths to compute for multi-path routing", maxPaths);
     cmd.AddValue("enableEnhancedQoS", "Enable enhanced QoS with meters and traffic classes", enableEnhancedQoS);
     cmd.AddValue("enableSDNTesting", "Enable comprehensive SDN realism testing framework", enableSDNTesting);
-    cmd.AddValue("enableDynamicTuning", "Enable dynamic bias tuning in QKD controller", enableDynamicTuning);
+    cmd.AddValue("enableDynamicBias", "Enable dynamic bias tuning in QKD controller", enableDynamicTuning);
     cmd.AddValue("enableMlBridge", "Enable ML bridge for external QKD control", enableMlBridge);
     cmd.AddValue("mlHost", "ML bridge host address", mlHost);
     cmd.AddValue("mlPort", "ML bridge port number", mlPort);
@@ -2775,12 +2768,15 @@ private:
     biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000));  // Align with window period
     biasCtrl->SetTargetX(0.10);  // Target 10% X-basis detection rate
     biasCtrl->SetGain(0.08);     // Servo gain for bias adjustment
-    biasCtrl->SetDynamicTuning(enableDynamicTuning); // Enable/disable dynamic tuning
+    biasCtrl->EnableDynamicBias(enableDynamicTuning); // Enable/disable dynamic tuning
     
     // Configure ML bridge if enabled
     if (enableMlBridge) {
-        biasCtrl->SetMlBridge(mlHost, mlPort);
-        std::cout << "QKD Bias Controller: ML Bridge enabled (" << mlHost << ":" << mlPort << ")" << std::endl;
+        if (biasCtrl->ConnectMl(mlHost, mlPort)) {
+            std::cout << "QKD Bias Controller: ML Bridge connected (" << mlHost << ":" << mlPort << ")" << std::endl;
+        } else {
+            std::cout << "QKD Bias Controller: ML Bridge connection failed, using fallback control" << std::endl;
+        }
     } else {
         std::cout << "QKD Bias Controller: Internal control only (dynamic=" << enableDynamicTuning << ")" << std::endl;
     }
