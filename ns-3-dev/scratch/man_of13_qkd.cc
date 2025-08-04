@@ -2768,15 +2768,14 @@ private:
     biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000));  // Align with window period
     biasCtrl->SetTargetX(0.10);  // Target 10% X-basis detection rate
     biasCtrl->SetGain(0.08);     // Servo gain for bias adjustment
-    biasCtrl->EnableDynamicBias(enableDynamicTuning); // Enable/disable dynamic tuning
     
-    // Configure ML bridge if enabled
+    // After creating 'ctrl'
+    biasCtrl->EnableDynamicBias(enableDynamicTuning);                 // set false for static pZ runs (simulation parameter)
+    
+    // Optional ML socket (run your Python on localhost:5557)
     if (enableMlBridge) {
-        if (biasCtrl->ConnectMl(mlHost, mlPort)) {
-            std::cout << "QKD Bias Controller: ML Bridge connected (" << mlHost << ":" << mlPort << ")" << std::endl;
-        } else {
-            std::cout << "QKD Bias Controller: ML Bridge connection failed, using fallback control" << std::endl;
-        }
+        bool ok = biasCtrl->ConnectMl("127.0.0.1", 5557);
+        std::cout << "ML bridge " << (ok ? "connected" : "not connected (fallback)") << std::endl;
     } else {
         std::cout << "QKD Bias Controller: Internal control only (dynamic=" << enableDynamicTuning << ")" << std::endl;
     }
