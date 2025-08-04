@@ -25,8 +25,291 @@
 #include <queue>
 #include <algorithm>
 #include <atomic>
+#include <random>      // std::mt19937, std::binomial_distribution
+#include <cmath>       // std::ceil, std::log2
 
 using namespace ns3;
+
+// QKD: Fiber channel (shared span, WDM-aware)
+namespace ns3 { namespace qkd {
+
+class QkdFiberChannel : public Channel {
+public:
+  static TypeId GetTypeId(); QkdFiberChannel();
+  void Attach(Ptr<NetDevice> dev, double lambdaNm);           // register device+λ
+  void UpdateClassicalLoad(double lambdaNm, double mbps);     // feed classical Mbps
+  struct BatchOutcome { uint32_t nTx, nLost, nDepol; };
+  BatchOutcome Propagate(uint32_t nPulses, double lambdaNm, double baseDepol); // batch sim
+  // Channel plumbing:
+  std::size_t GetNDevices() const override; Ptr<NetDevice> GetDevice(std::size_t i) const override;
+private:
+  struct Port { Ptr<NetDevice> dev; double lambdaNm; double mbps=0.0; };
+  std::vector<Port> m_ports;
+  double m_lenKm=10.0, m_lossDb=4.0, m_depol0=1e-4, m_k=5e-4, m_sigmaNm=10.0;
+  double ExtraDepol(double lambdaNm) const;                   // Gaussian vs |Δλ|
+};
+
+// QKD: NetDevice (quantum module on a node)
+struct QkdStats { uint32_t nXX=0, nZZ=0, errX=0, errZ=0; double qberX=0.0; };
+
+class QkdNetDevice : public NetDevice {
+public:
+  static TypeId GetTypeId(); QkdNetDevice();
+  void SetChannel(Ptr<QkdFiberChannel> ch); void SetLambda(double nm); void SetBasisBias(double pZ);
+  void SendBatch(uint32_t nPulses);             // Tx: prepare bases/bits with bias and emit
+  void ReceiveBatch(uint32_t nDetect);          // Rx: measure with bias (stub for now)
+  QkdStats GetRollingStats() const { return m_stats; }
+
+  // minimal NetDevice overrides used by ns-3 (others can be stubs)
+  Ptr<Node> GetNode() const override { return m_node; } void SetNode(Ptr<Node> n) override { m_node=n; }
+  Ptr<Channel> GetChannel() const override { return m_ch; } bool IsPointToPoint() const override { return true; }
+  void SetReceiveCallback(ReceiveCallback cb) override { m_rx=cb; }
+  
+  // Required NetDevice pure virtual methods (stubs)
+  void SetIfIndex(uint32_t index) override { m_ifIndex = index; }
+  uint32_t GetIfIndex() const override { return m_ifIndex; }
+  void SetAddress(Address address) override { m_address = address; }
+  Address GetAddress() const override { return m_address; }
+  bool SetMtu(uint16_t mtu) override { m_mtu = mtu; return true; }
+  uint16_t GetMtu() const override { return m_mtu; }
+  bool IsLinkUp() const override { return true; }
+  void AddLinkChangeCallback(Callback<void> callback) override { }
+  bool IsBroadcast() const override { return false; }
+  Address GetBroadcast() const override { return Address(); }
+  bool IsMulticast() const override { return false; }
+  Address GetMulticast(Ipv4Address addr) const override { return Address(); }
+  Address GetMulticast(Ipv6Address addr) const override { return Address(); }
+  bool IsBridge() const override { return false; }
+  bool Send(Ptr<Packet> packet, const Address& dest, uint16_t protocolNumber) override { return false; }
+  bool SendFrom(Ptr<Packet> packet, const Address& src, const Address& dest, uint16_t protocolNumber) override { return false; }
+  bool NeedsArp() const override { return false; }
+  void SetPromiscReceiveCallback(PromiscReceiveCallback cb) override { }
+  bool SupportsSendFrom() const override { return false; }
+
+private:
+  Ptr<QkdFiberChannel> m_ch; Ptr<Node> m_node; ReceiveCallback m_rx;
+  double m_lambdaNm=1550.12, m_pZ=0.9, m_baseDepol=0.0;
+  QkdStats m_stats;
+  // NetDevice required members
+  uint32_t m_ifIndex=0; Address m_address; uint16_t m_mtu=1500;
+  
+  // Tx/Rx bias (allow separate knobs; keep SetBasisBias() to set both)
+  double m_pZ_tx = 0.9;
+  double m_pZ_rx = 0.9;
+
+  // intrinsic (non-depolarization) error floors per basis
+  double m_eZ0 = 0.01;   // adjust as needed
+  double m_eX0 = 0.02;
+
+  // RNG for batch sampling (can be replaced with ns-3 streams later)
+  std::mt19937 m_rng { 0xC0FFEE }; // deterministic seed; switch to AssignStreams later
+  
+  // helpers:
+  void SiftAndUpdate(/* tx/rx buffers here later */);  // updates nXX/nZZ/errX/errZ
+};
+
+// QKD: Security helpers (M1 + finite-key estimate)
+inline bool PassesM1(uint32_t nXX, uint32_t N){ return nXX >= (uint32_t)std::ceil(std::log2(std::max(1u,N))); }
+
+inline double Hb(double x){ if(x<=0||x>=1) return 0.0; return -x*std::log2(x)-(1-x)*std::log2(1-x); }
+
+inline uint32_t EstimateSecretBits(uint32_t nZZ, double qberX, double ecEff=1.1){
+  // very simple first cut: nZZ * (1 - ecEff*Hb(qberX)) clamped to 0
+  double s = nZZ * (1.0 - ecEff*Hb(qberX));
+  return (uint32_t) std::max(0.0, s);
+}
+
+// QKD: Key buffer/manager
+class QkdKeyManager {
+public:
+  void Update(const QkdStats& s, uint32_t N){
+    if (PassesM1(s.nXX, N)) { m_lastBits = EstimateSecretBits(s.nZZ, s.qberX); m_ok=true; }
+    else { m_lastBits = 0; m_ok=false; }
+    m_buf += m_lastBits;
+  }
+  uint32_t Drain(uint32_t want){ uint32_t g=std::min(want,m_buf); m_buf-=g; return g; }
+  uint32_t Buffer() const { return m_buf; } bool Healthy() const { return m_ok; }
+private:
+  uint32_t m_buf=0, m_lastBits=0; bool m_ok=false;
+};
+
+}} // ns3::qkd
+
+// --- QKD: Fiber channel implementation ---
+namespace ns3 { namespace qkd {
+
+NS_OBJECT_ENSURE_REGISTERED (QkdFiberChannel);
+
+TypeId QkdFiberChannel::GetTypeId ()
+{
+  static TypeId tid = TypeId ("ns3::qkd::QkdFiberChannel")
+    .SetParent<Channel> ()
+    .AddConstructor<QkdFiberChannel> ()
+    .AddAttribute ("LengthKm", "Span length (km)",
+                   DoubleValue (10.0),
+                   MakeDoubleAccessor (&QkdFiberChannel::m_lenKm),
+                   MakeDoubleChecker<double> (0.0))
+    .AddAttribute ("LossDb", "Span attenuation (dB)",
+                   DoubleValue (4.0),
+                   MakeDoubleAccessor (&QkdFiberChannel::m_lossDb),
+                   MakeDoubleChecker<double> (0.0))
+    .AddAttribute ("BaseDepol", "Intrinsic depolarisation probability",
+                   DoubleValue (1e-4),
+                   MakeDoubleAccessor (&QkdFiberChannel::m_depol0),
+                   MakeDoubleChecker<double> (0.0, 1.0))
+    .AddAttribute ("XtalkK", "Amplitude of Gaussian cross-talk term",
+                   DoubleValue (5e-4),
+                   MakeDoubleAccessor (&QkdFiberChannel::m_k),
+                   MakeDoubleChecker<double> (0.0))
+    .AddAttribute ("XtalkSigmaNm", "σ (nm) of Gaussian cross-talk",
+                   DoubleValue (10.0),
+                   MakeDoubleAccessor (&QkdFiberChannel::m_sigmaNm),
+                   MakeDoubleChecker<double> (1e-3));
+  return tid;
+}
+
+QkdFiberChannel::QkdFiberChannel () {}
+
+std::size_t QkdFiberChannel::GetNDevices () const { return m_ports.size (); }
+
+Ptr<NetDevice> QkdFiberChannel::GetDevice (std::size_t i) const { return m_ports.at (i).dev; }
+
+void QkdFiberChannel::Attach (Ptr<NetDevice> dev, double lambdaNm)
+{
+  m_ports.push_back ({dev, lambdaNm, 0.0});
+}
+
+void QkdFiberChannel::UpdateClassicalLoad (double lambdaNm, double mbps)
+{
+  for (auto &p : m_ports)
+    if (std::abs (p.lambdaNm - lambdaNm) < 1e-6) { p.mbps = mbps; break; }
+}
+
+// Gaussian-weighted Raman/crosstalk from other λ, scaled by their Mbps
+double QkdFiberChannel::ExtraDepol (double lambdaNm) const
+{
+  double extra = 0.0;
+  for (const auto &p : m_ports)
+    {
+      if (p.mbps <= 0.0 || p.lambdaNm == lambdaNm) continue;
+      const double d = std::abs (p.lambdaNm - lambdaNm);
+      extra += (p.mbps / 1e3) * m_k * std::exp (- (d*d) / (2 * m_sigmaNm * m_sigmaNm));
+    }
+  return extra;
+}
+
+// Batch propagate N pulses at λ: sample loss + (baseDepol + intrinsic + crosstalk)
+QkdFiberChannel::BatchOutcome
+QkdFiberChannel::Propagate (uint32_t nPulses, double lambdaNm, double baseDepol)
+{
+  // quick dB→prob; feel free to swap for a length/atten coeff model later
+  const double lossProb = 1.0 - std::pow (10.0, -m_lossDb / 10.0);
+  const double depolProb = std::min (1.0,
+    std::max (0.0, baseDepol + m_depol0 + ExtraDepol (lambdaNm)));
+
+  Ptr<UniformRandomVariable> urv = CreateObject<UniformRandomVariable> ();
+  BatchOutcome o { nPulses, 0u, 0u };
+
+  for (uint32_t i = 0; i < nPulses; ++i)
+    {
+      if (urv->GetValue () < lossProb) { ++o.nLost; continue; }
+      if (urv->GetValue () < depolProb) { ++o.nDepol; }
+    }
+  return o;
+}
+
+}} // namespace ns3::qkd
+
+// --- QKD: NetDevice implementation (minimal, good for smoke test) -------------
+namespace ns3 { namespace qkd {
+
+NS_OBJECT_ENSURE_REGISTERED (QkdNetDevice);
+
+TypeId QkdNetDevice::GetTypeId ()
+{
+  static TypeId tid = TypeId ("ns3::qkd::QkdNetDevice")
+    .SetParent<NetDevice> ()
+    .AddConstructor<QkdNetDevice> ();
+  return tid;
+}
+
+QkdNetDevice::QkdNetDevice () {}
+
+void QkdNetDevice::SetChannel (Ptr<QkdFiberChannel> ch)
+{
+  m_ch = ch;
+  if (m_ch && m_lambdaNm > 0.0) m_ch->Attach (this, m_lambdaNm);
+}
+
+void QkdNetDevice::SetLambda (double nm)
+{
+  m_lambdaNm = nm;
+  if (m_ch) m_ch->Attach (this, m_lambdaNm);           // safe double-attach is fine
+}
+
+void QkdNetDevice::SetBasisBias (double pZ) 
+{ 
+  pZ = std::clamp(pZ, 0.05, 0.95); 
+  m_pZ_tx = m_pZ_rx = pZ; 
+}
+
+/* ----- Tx path: generate biased bases/bits, call fibre, update stats ---------- */
+void QkdNetDevice::SendBatch (uint32_t nPulses)
+{
+  if (!m_ch) { std::cout << "QkdNetDevice: no channel" << std::endl; return; }
+
+  // 1) Channel propagation → loss + depolarization probability (aggregated)
+  auto out = m_ch->Propagate (nPulses, m_lambdaNm, m_baseDepol);
+  const uint32_t nLost      = out.nLost;
+  const uint32_t nDetected  = out.nTx - nLost;          // pulses that reached detector
+  const uint32_t nDepolTot  = out.nDepol;               // among those, got depolarized (randomized)
+
+  if (nDetected == 0) return;
+
+  // 2) Basis choices for detected pulses (multinomial via chained binomials)
+  //    Categories: ZZ, ZX, XZ, XX with probs:
+  //    p_ZZ = pZ_tx*pZ_rx; p_ZX = pZ_tx*(1-pZ_rx); p_XZ = (1-pZ_tx)*pZ_rx; p_XX = (1-pZ_tx)*(1-pZ_rx)
+  auto binom = [&](uint32_t n, double p){ std::binomial_distribution<uint32_t> B(n, std::clamp(p,0.0,1.0)); return B(m_rng); };
+
+  const double pZZ = m_pZ_tx * m_pZ_rx;
+  const double pZX = m_pZ_tx * (1.0 - m_pZ_rx);
+  const double pXZ = (1.0 - m_pZ_tx) * m_pZ_rx;
+  const double pXX = 1.0 - (pZZ + pZX + pXZ);
+  (void)pXX;  // suppress unused warning
+
+  uint32_t nZZ = binom(nDetected, pZZ);
+  uint32_t rem = nDetected - nZZ;
+  uint32_t nZX = binom(rem, pZX / (1.0 - pZZ));
+  rem -= nZX;
+  uint32_t nXZ = binom(rem, pXZ / (1.0 - pZZ - pZX));
+  uint32_t nXX = rem - nXZ;
+
+  // 3) Distribute depolarized detections across categories proportionally
+  auto prop = [&](uint32_t nCat, uint32_t nTot){ return (nTot==0)?0u : (uint32_t) std::round(double(nDepolTot) * (double(nCat)/double(nTot))); };
+  uint32_t dZZ = prop(nZZ, nDetected);
+  uint32_t dXX = prop(nXX, nDetected);
+  // (dZX, dXZ) don't affect key; they're mismatched-basis events
+
+  // 4) Errors in matched bases:
+  //    depolarized → random outcome (50% error), non-depolarized → intrinsic error floors eZ0/eX0
+  auto binomErr = [&](uint32_t n, double perr){ return (n==0)?0u : binom(n, std::clamp(perr,0.0,1.0)); };
+
+  const uint32_t errZ = binomErr(dZZ, 0.5) + binomErr(nZZ - dZZ, m_eZ0);
+  const uint32_t errX = binomErr(dXX, 0.5) + binomErr(nXX - dXX, m_eX0);
+
+  // 5) Update rolling stats + QBER_X
+  m_stats.nZZ += nZZ;
+  m_stats.nXX += nXX;
+  m_stats.errZ += errZ;
+  m_stats.errX += errX;
+  m_stats.qberX  = (m_stats.nXX ? double(m_stats.errX) / m_stats.nXX : 0.0);
+}
+
+void QkdNetDevice::ReceiveBatch (uint32_t) { /* not used in this stub */ }
+
+/* optional helper for later: SiftAndUpdate() would live here */
+
+}} // ns3::qkd
 
 // Link Failure and Recovery Module for Network Robustness Testing
 enum class FailureType {
@@ -1369,6 +1652,34 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     uint8_t m_tos{0xC0};  // Default to CS6
   };
 
+// QKD: Controller (poll + act)
+namespace ns3 {
+class ControllerApp : public Application {
+public:
+  void AddDevice(Ptr<qkd::QkdNetDevice> d){ m_devs.push_back(d); }
+  void SetPeriod(Time t){ m_T=t; }
+  void StartApplication() override { Simulator::Schedule(m_T, &ControllerApp::Tick, this); }
+private:
+  void Tick(){
+    for (auto d : m_devs){
+      auto s = d->GetRollingStats();
+      // placeholder policy: keep pZ high but not 1.0
+      d->SetBasisBias(0.9);
+      // TODO: program OpenFlow routes here as needed
+    }
+    Simulator::Schedule(m_T, &ControllerApp::Tick, this);
+  }
+  std::vector<Ptr<qkd::QkdNetDevice>> m_devs; Time m_T=Seconds(0.5);
+};
+} // ns3
+
+// QKD: ML bridge placeholders (replace with ZMQ/gRPC later)
+namespace ns3 { namespace qkd {
+struct Obs { double qberX; uint32_t nXX,nZZ,buf; /* + topo features later */ };
+struct Act { double pZ; /* + route, lambda */ };
+inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
+}} // ns3::qkd
+
   static NetDeviceContainer Link(Ptr<Node>a, Ptr<Node>b, std::string rate, std::string delay, uint32_t txQueueMaxP = 25)
   {
     CsmaHelper csma;
@@ -2059,6 +2370,42 @@ static void PollQ(QueueDiscContainer qds, Time interval) {
     ApplicationContainer qctrlSinkApp = (usingCsv
       ? qctrlSink.Install(hostByIndex[qDst])
       : qctrlSink.Install(man.host[qDst]));
+
+    // --- QKD Layer Setup (after classical link A<->B is built) ---
+    Ptr<qkd::QkdFiberChannel> qch = CreateObject<qkd::QkdFiberChannel>();
+
+    Ptr<qkd::QkdNetDevice> alice = CreateObject<qkd::QkdNetDevice>();
+    alice->SetNode(usingCsv ? hostByIndex[qSrc] : man.host[qSrc]); 
+    alice->SetChannel(qch); 
+    alice->SetLambda(1550.12); 
+    alice->SetBasisBias(0.9);
+
+    Ptr<qkd::QkdNetDevice> bob = CreateObject<qkd::QkdNetDevice>();
+    bob->SetNode(usingCsv ? hostByIndex[qDst] : man.host[qDst]);   
+    bob->SetChannel(qch);   
+    bob->SetLambda(1550.12);   
+    bob->SetBasisBias(0.9);
+
+    // simple traffic: send batches every 10 ms
+    Simulator::ScheduleNow([alice]{ alice->SendBatch(5000); });
+    Simulator::Schedule(Seconds(0.01), [](){ /* repeat with EventId if you want periodic */ });
+
+    // Test QKD implementation
+    Simulator::Schedule(Seconds(0.1), [alice](){
+      alice->SendBatch(10000);   // send test batch
+      auto stats = alice->GetRollingStats();
+      std::cout << "Alice QKD test: nXX=" << stats.nXX
+                << " nZZ=" << stats.nZZ 
+                << " QBER_X=" << stats.qberX << std::endl;
+    });
+
+    // Controller
+    Ptr<ControllerApp> qkdCtrl = CreateObject<ControllerApp>();
+    qkdCtrl->SetPeriod(Seconds(0.5)); 
+    (usingCsv ? hostByIndex[0] : man.host[0])->AddApplication(qkdCtrl);
+    qkdCtrl->AddDevice(alice); 
+    qkdCtrl->AddDevice(bob);
+    qkdCtrl->SetStartTime(Seconds(0.0));
 
     // Schedule error summary for simulation teardown
     if (g_verbosity >= 1) {
