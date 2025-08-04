@@ -434,6 +434,80 @@ private:
 
 }} // ns3::qkd
 
+// --- QKD: Bias Controller per-session (basis bias + route hooks) ------------------
+namespace ns3 {
+
+class QkdBiasController : public Application {
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("ns3::QkdBiasController")
+      .SetParent<Application>()
+      .SetGroupName("Applications");
+    return tid;
+  }
+
+  void UseSessions(qkd::SessionManager* sm) { m_sm = sm; }
+  
+  void AddPair(qkd::SessionId s, Ptr<qkd::QkdNetDevice> tx, Ptr<qkd::QkdNetDevice> rx) {
+    m_pairs.push_back({s, tx, rx});
+  }
+  
+  void SetPeriod(Time t) { m_T = t; }          // align with your window
+  void SetTargetX(double r) { m_rX = std::clamp(r, 0.05, 0.3); }
+  void SetGain(double k) { m_k = std::clamp(k, 0.01, 0.5); }
+
+protected:
+  void StartApplication() override { 
+    m_evt = Simulator::Schedule(m_T, &QkdBiasController::Tick, this); 
+  }
+  
+  void StopApplication() override { 
+    if (m_evt.IsRunning()) m_evt.Cancel(); 
+  }
+
+private:
+  void Tick() {
+    for (auto& p : m_pairs) {
+      if (!m_sm) continue;
+      const auto& v = m_sm->View(p.sid);
+      const double matched = double(v.nXX + v.nZZ);
+      if (matched > 0) {
+        const double rX = double(v.nXX) / matched;
+        auto biases = p.tx->GetBiases();
+        double pZnew = std::clamp(biases.first - m_k * (m_rX - rX), 0.05, 0.95);
+        p.tx->SetTxBasisBias(pZnew);
+        
+        // Use printf instead of NS_LOG to avoid log conflicts
+        std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
+                  << " rX=" << rX << " target=" << m_rX 
+                  << " pZ: " << biases.first << "->" << pZnew << std::endl;
+                     
+        // TODO route hook: ProgramRoute(p.sid, /*path*/);
+      }
+    }
+    m_evt = Simulator::Schedule(m_T, &QkdBiasController::Tick, this);
+  }
+
+  // Future route programming hook for OFSwitch13 integration
+  void ProgramRoute(const qkd::SessionId& sid, const std::vector<uint64_t>& path) {
+    // Stub for future OFSwitch13 route programming
+    // This will allow dynamic routing based on QKD session requirements
+    std::cout << "TODO: Program route for session " << sid.src << "->" << sid.dst << std::endl;
+  }
+
+  struct Pair { 
+    qkd::SessionId sid; 
+    Ptr<qkd::QkdNetDevice> tx, rx; 
+  };
+  
+  std::vector<Pair> m_pairs; 
+  qkd::SessionManager* m_sm = nullptr;
+  Time m_T = MilliSeconds(100); 
+  double m_rX = 0.10, m_k = 0.08; 
+  EventId m_evt;
+};
+} // namespace ns3
+
 // Link Failure and Recovery Module for Network Robustness Testing
 enum class FailureType {
   FIBER_CUT,      // Complete link failure
@@ -2570,6 +2644,21 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     sessions.Create(sAB);
     sessions.Bind(sAB, alice, bob);
     
+    // --- QKD Bias Controller Application Setup ---
+    // Create QKD bias controller for per-session bias servo and route management
+    Ptr<QkdBiasController> biasCtrl = CreateObject<QkdBiasController>();
+    biasCtrl->UseSessions(&sessions);
+    biasCtrl->AddPair(sAB, alice, bob);
+    biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000));  // Align with window period
+    biasCtrl->SetTargetX(0.10);  // Target 10% X-basis detection rate
+    biasCtrl->SetGain(0.08);     // Servo gain for bias adjustment
+    
+    // Install bias controller on Alice's node
+    Ptr<Node> biasControllerNode = usingCsv ? hostByIndex[qSrc] : man.host[qSrc];
+    biasControllerNode->AddApplication(biasCtrl);
+    biasCtrl->SetStartTime(Seconds(1.0));  // Start after initial QKD stabilization
+    biasCtrl->SetStopTime(Seconds(20.0));  // Run for simulation duration
+    
     // Create and install classical load monitoring application
     Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
     loadMonitor->SetMonitoringPeriod(MilliSeconds(100)); // Monitor every 100ms
@@ -2746,13 +2835,13 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     };
     Simulator::Schedule(Seconds(5.0), classicalFn);  // Start after 5 seconds
 
-    // Controller
-    Ptr<ControllerApp> qkdCtrl = CreateObject<ControllerApp>();
-    qkdCtrl->SetPeriod(Seconds(0.5)); 
-    (usingCsv ? hostByIndex[0] : man.host[0])->AddApplication(qkdCtrl);
-    qkdCtrl->AddDevice(alice); 
-    qkdCtrl->AddDevice(bob);
-    qkdCtrl->SetStartTime(Seconds(0.0));
+    // Legacy simple controller (disabled - using QkdBiasController instead)
+    // Ptr<ControllerApp> qkdCtrl = CreateObject<ControllerApp>();
+    // qkdCtrl->SetPeriod(Seconds(0.5)); 
+    // (usingCsv ? hostByIndex[0] : man.host[0])->AddApplication(qkdCtrl);
+    // qkdCtrl->AddDevice(alice); 
+    // qkdCtrl->AddDevice(bob);
+    // qkdCtrl->SetStartTime(Seconds(0.0));
 
     // Schedule error summary for simulation teardown
     if (g_verbosity >= 1) {
