@@ -434,6 +434,79 @@ private:
 
 }} // ns3::qkd
 
+// --- QKD: ML obs/act ---------------------------------------------------------
+namespace ns3 { namespace qkd {
+struct Obs {
+  uint32_t src, dst;      // node ids (session)
+  uint32_t nXX, nZZ;      // matched counts in last window
+  double   qberX;         // last-window QBER_X
+  uint32_t keyBuf;        // buffered secret bits for this pair
+  double   pZtx;          // current transmitter bias
+};
+struct Act {
+  bool     hasPz = false; // if true, apply pZ
+  double   pZ     = 0.9;  // desired transmitter pZ
+};
+}} // ns3::qkd
+
+// --- QKD: MLBridge (very small TCP JSONL client) -----------------------------
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+namespace ns3 { namespace qkd {
+class MlBridge {
+public:
+  MlBridge() = default;
+  bool Connect(const std::string& host, uint16_t port) {
+    if (m_fd != -1) return true;
+    m_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (m_fd < 0) return false;
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (::connect(m_fd, (sockaddr*)&addr, sizeof(addr)) < 0) { ::close(m_fd); m_fd=-1; return false; }
+    // small recv timeout so Tick() never blocks
+    timeval tv{0, 50*1000}; // 50 ms
+    ::setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return true;
+  }
+  void Close(){ if (m_fd!=-1){ ::close(m_fd); m_fd=-1; } }
+
+  bool SendObs(const Obs& o){
+    if (m_fd==-1) return false;
+    // minimal JSON (no deps). Values are safe; no quoting needed.
+    std::ostringstream ss;
+    ss << "{\"src\":"<<o.src<<",\"dst\":"<<o.dst
+       <<",\"nXX\":"<<o.nXX<<",\"nZZ\":"<<o.nZZ
+       <<",\"qberX\":"<<o.qberX<<",\"keyBuf\":"<<o.keyBuf
+       <<",\"pZtx\":"<<o.pZtx<<"}\n";
+    auto s = ss.str();
+    return ::send(m_fd, s.data(), s.size(), 0) == (ssize_t)s.size();
+  }
+
+  bool TryRecvAct(Act& a){
+    if (m_fd==-1) return false;
+    char buf[256]; int n = ::recv(m_fd, buf, sizeof(buf)-1, 0);
+    if (n <= 0) return false;
+    buf[n] = 0;
+    // Expect something like: {"pZ":0.87}\n (very lenient parse)
+    const char* p = std::strstr(buf, "\"pZ\"");
+    if (!p) return false;
+    double val = 0.0;
+    if (std::sscanf(p, "\"pZ\"%*[^0-9.-]%lf", &val) == 1){
+      a.hasPz = true; a.pZ = std::clamp(val, 0.05, 0.95);
+      return true;
+    }
+    return false;
+  }
+
+  ~MlBridge(){ Close(); }
+private:
+  int m_fd = -1;
+};
+}} // ns3::qkd
+
 // --- QKD: Bias Controller per-session (basis bias + route hooks) ------------------
 namespace ns3 {
 
@@ -455,14 +528,27 @@ public:
   void SetPeriod(Time t) { m_T = t; }          // align with your window
   void SetTargetX(double r) { m_rX = std::clamp(r, 0.05, 0.3); }
   void SetGain(double k) { m_k = std::clamp(k, 0.01, 0.5); }
+  void SetDynamicTuning(bool enable) { m_dynamicTuning = enable; }
+  void SetMlBridge(const std::string& host, uint16_t port) { 
+    m_mlHost = host; m_mlPort = port; m_useMl = true; 
+  }
 
 protected:
   void StartApplication() override { 
+    if (m_useMl) {
+      if (m_bridge.Connect(m_mlHost, m_mlPort)) {
+        std::cout << "ML Bridge connected to " << m_mlHost << ":" << m_mlPort << std::endl;
+      } else {
+        std::cout << "ML Bridge connection failed, continuing without ML" << std::endl;
+        m_useMl = false;
+      }
+    }
     m_evt = Simulator::Schedule(m_T, &QkdBiasController::Tick, this); 
   }
   
   void StopApplication() override { 
-    if (m_evt.IsRunning()) m_evt.Cancel(); 
+    if (m_evt.IsRunning()) m_evt.Cancel();
+    if (m_useMl) m_bridge.Close();
   }
 
 private:
@@ -474,13 +560,40 @@ private:
       if (matched > 0) {
         const double rX = double(v.nXX) / matched;
         auto biases = p.tx->GetBiases();
-        double pZnew = std::clamp(biases.first - m_k * (m_rX - rX), 0.05, 0.95);
-        p.tx->SetTxBasisBias(pZnew);
         
-        // Use printf instead of NS_LOG to avoid log conflicts
-        std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
-                  << " rX=" << rX << " target=" << m_rX 
-                  << " pZ: " << biases.first << "->" << pZnew << std::endl;
+        // Send observation to ML bridge if enabled
+        if (m_useMl) {
+          qkd::Obs obs;
+          obs.src = p.sid.src;
+          obs.dst = p.sid.dst;
+          obs.nXX = v.nXX;
+          obs.nZZ = v.nZZ;
+          obs.qberX = v.qberX;
+          obs.keyBuf = v.buf;  // Use 'buf' from SessionView
+          obs.pZtx = biases.first;
+          
+          if (m_bridge.SendObs(obs)) {
+            // Try to receive action from ML
+            qkd::Act act;
+            if (m_bridge.TryRecvAct(act) && act.hasPz) {
+              double pZnew = std::clamp(act.pZ, 0.05, 0.95);
+              p.tx->SetTxBasisBias(pZnew);
+              std::cout << "ML BiasController: Session " << p.sid.src << "->" << p.sid.dst 
+                        << " rX=" << rX << " ML_pZ=" << pZnew << std::endl;
+              continue; // Skip internal control if ML provided action
+            }
+          }
+        }
+        
+        // Internal proportional control (if dynamic tuning enabled and no ML action)
+        if (m_dynamicTuning) {
+          double pZnew = std::clamp(biases.first - m_k * (m_rX - rX), 0.05, 0.95);
+          p.tx->SetTxBasisBias(pZnew);
+          
+          std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
+                    << " rX=" << rX << " target=" << m_rX 
+                    << " pZ: " << biases.first << "->" << pZnew << std::endl;
+        }
                      
         // TODO route hook: ProgramRoute(p.sid, /*path*/);
       }
@@ -504,6 +617,11 @@ private:
   qkd::SessionManager* m_sm = nullptr;
   Time m_T = MilliSeconds(100); 
   double m_rX = 0.10, m_k = 0.08; 
+  bool m_dynamicTuning = true;
+  bool m_useMl = false;
+  std::string m_mlHost = "127.0.0.1";
+  uint16_t m_mlPort = 8888;
+  qkd::MlBridge m_bridge;
   EventId m_evt;
 };
 } // namespace ns3
@@ -1908,12 +2026,7 @@ private:
 };
 } // ns3
 
-// QKD: ML bridge placeholders (replace with ZMQ/gRPC later)
-namespace ns3 { namespace qkd {
-struct Obs { double qberX; uint32_t nXX,nZZ,buf; /* + topo features later */ };
-struct Act { double pZ; /* + route, lambda */ };
-inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
-}} // ns3::qkd
+// QKD: ML bridge placeholders removed (using main definitions above)
 
   static NetDeviceContainer Link(Ptr<Node>a, Ptr<Node>b, std::string rate, std::string delay, uint32_t txQueueMaxP = 25)
   {
@@ -2174,6 +2287,12 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     // Testing framework parameters
     bool enableSDNTesting = false;    // Enable comprehensive SDN realism testing
     
+    // QKD Bias Controller ML parameters
+    bool enableDynamicTuning = true;  // Enable dynamic bias tuning
+    bool enableMlBridge = false;      // Enable ML bridge for external control
+    std::string mlHost = "127.0.0.1"; // ML bridge host
+    uint16_t mlPort = 8888;           // ML bridge port
+    
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
     cmd.AddValue("run", "RNG run number", run);
@@ -2201,6 +2320,10 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     cmd.AddValue("maxPaths", "Maximum number of paths to compute for multi-path routing", maxPaths);
     cmd.AddValue("enableEnhancedQoS", "Enable enhanced QoS with meters and traffic classes", enableEnhancedQoS);
     cmd.AddValue("enableSDNTesting", "Enable comprehensive SDN realism testing framework", enableSDNTesting);
+    cmd.AddValue("enableDynamicTuning", "Enable dynamic bias tuning in QKD controller", enableDynamicTuning);
+    cmd.AddValue("enableMlBridge", "Enable ML bridge for external QKD control", enableMlBridge);
+    cmd.AddValue("mlHost", "ML bridge host address", mlHost);
+    cmd.AddValue("mlPort", "ML bridge port number", mlPort);
     cmd.Parse(argc, argv);
 
     // Set deterministic seed
@@ -2652,6 +2775,15 @@ inline Act MlPolicy(const Obs& o){ return Act{0.9}; } // stub
     biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000));  // Align with window period
     biasCtrl->SetTargetX(0.10);  // Target 10% X-basis detection rate
     biasCtrl->SetGain(0.08);     // Servo gain for bias adjustment
+    biasCtrl->SetDynamicTuning(enableDynamicTuning); // Enable/disable dynamic tuning
+    
+    // Configure ML bridge if enabled
+    if (enableMlBridge) {
+        biasCtrl->SetMlBridge(mlHost, mlPort);
+        std::cout << "QKD Bias Controller: ML Bridge enabled (" << mlHost << ":" << mlPort << ")" << std::endl;
+    } else {
+        std::cout << "QKD Bias Controller: Internal control only (dynamic=" << enableDynamicTuning << ")" << std::endl;
+    }
     
     // Install bias controller on Alice's node
     Ptr<Node> biasControllerNode = usingCsv ? hostByIndex[qSrc] : man.host[qSrc];
