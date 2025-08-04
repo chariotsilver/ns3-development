@@ -44,8 +44,8 @@ def serve(port=5557):
         buf = b""
         observation_count = 0
         
-        # Global state for hill-climbing across observations
-        state = {"pz": 0.9, "best_skr": -1.0, "step": 0.05}
+        # per-session state: { "pz": float, "best_skr": float, "step": float }
+        states = {}
         
         while True:
             # Receive data from NS-3
@@ -67,39 +67,33 @@ def serve(port=5557):
                     
                     print(f"Observation {observation_count}: {obs}")
                     
+                    # Per-session state tracking
+                    sid = f"{obs.get('src',0)}->{obs.get('dst',1)}"
+                    st = states.setdefault(sid, {"pz": obs.get("pZtx", 0.9), "best_skr": -1.0, "step": 0.05})
+                    
                     # Extract SKR signals
                     win_bits = obs.get("lastBits", 0)
                     win_sec = max(1e-6, obs.get("winSec", 0.1))
                     skr = win_bits / win_sec  # bits per second
                     
-                    pz_current = obs.get("pZtx", 0.9)
-                    session_id = f"{obs.get('src', 0)}->{obs.get('dst', 1)}"
+                    cur_pz, cur_best, step = st["pz"], st["best_skr"], st["step"]
                     
-                    # Hill-climbing SKR optimization
-                    cur_pz = state["pz"]
-                    cur_best = state["best_skr"]
-                    step = state["step"]
-                    
-                    # If we improved, keep direction; else try the other side and shrink step
-                    if skr > cur_best:
+                    # Hill-climbing SKR optimization with per-session state
+                    if skr > cur_best + 1e-9:          # improved: keep direction & (optionally) grow step a bit
                         cur_best = skr
-                        # keep moving same direction next time
-                        print(f"  Session {session_id}: SKR improved! {cur_best:.1f}->{skr:.1f} bps, keeping direction")
-                    else:
-                        step = max(0.01, 0.5 * step)  # shrink step if no improvement
-                        step = -step                  # flip direction
-                        print(f"  Session {session_id}: No improvement, flipping direction, step={step:.3f}")
+                        step = min(0.2, step * 1.05)   # gentle expansion (optional)
+                        # keep step sign as-is → continue in same direction
+                        print(f"[{sid}] SKR ↑ to {skr:.1f} bps; step→{step:.3f}")
+                    else:                               # no improvement: flip direction and shrink
+                        step = -max(0.01, 0.5 * abs(step))
+                        print(f"[{sid}] SKR {skr:.1f} bps; flip dir, step→{step:.3f}")
                     
                     # Calculate new pZ
                     new_pz = max(0.05, min(0.95, cur_pz + step))
-                    
-                    # Update state
-                    state.update({"pz": new_pz, "best_skr": max(cur_best, skr), "step": step})
+                    states[sid].update({"pz": new_pz, "best_skr": max(cur_best, skr), "step": step})
                     
                     # Create action response
                     action = {"pZ": new_pz}
-                    
-                    print(f"  Session {session_id}: SKR={skr:.1f} bps, best={state['best_skr']:.1f} bps, pZ: {pz_current:.4f}->{new_pz:.4f}")
                     
                     # Send action back to NS-3
                     response = json.dumps(action).encode() + b"\n"
