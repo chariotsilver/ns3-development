@@ -155,6 +155,11 @@ private:
   double m_eZ0 = 0.01;   // adjust as needed
   double m_eX0 = 0.02;
 
+  // Realistic detection parameters
+  double m_eta = 0.15;          // detection efficiency (0..1)
+  double m_dcr = 200.0;         // dark counts per second (per detector)
+  Time   m_batchTs = MilliSeconds(10); // batch duration (match your sending cadence)
+
   // RNG for batch sampling (can be replaced with ns-3 streams later)
   std::mt19937 m_rng { 0xC0FFEE }; // deterministic seed; switch to AssignStreams later
   
@@ -298,8 +303,18 @@ void QkdNetDevice::SendBatch (uint32_t nPulses)
 
   // 1) Channel propagation → loss + depolarization probability (aggregated)
   auto out = m_ch->Propagate (nPulses, m_lambdaNm, m_baseDepol);
-  const uint32_t nLost      = out.nLost;
-  const uint32_t nDetected  = out.nTx - nLost;          // pulses that reached detector
+  
+  // detected from signal + dark counts during this batch window
+  const uint32_t nSignalArrived = out.nTx - out.nLost;
+  std::binomial_distribution<uint32_t> Bsig(nSignalArrived, std::clamp(m_eta,0.0,1.0));
+  uint32_t nSignalDet = Bsig(m_rng);
+
+  // Poisson dark counts over batch duration (2 detectors ~ X/Z)
+  double batchSec = m_batchTs.GetSeconds();
+  std::poisson_distribution<uint32_t> Pdark(std::max(0.0, 2.0 * m_dcr * batchSec));
+  uint32_t nDark = Pdark(m_rng);
+
+  const uint32_t nDetected = nSignalDet + nDark;
   const uint32_t nDepolTot  = out.nDepol;               // among those, got depolarized (randomized)
 
   if (nDetected == 0) return;
