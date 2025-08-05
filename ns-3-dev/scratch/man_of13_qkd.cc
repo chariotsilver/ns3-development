@@ -453,6 +453,8 @@ struct Obs {
   double   pZtx;          // current transmitter bias
   uint32_t lastBits;      // secret bits produced in last window (post M1 & finite-key)
   double   winSec;        // window duration in seconds
+  double   siftRttMs{0};      // classical sifting RTT in milliseconds
+  uint32_t siftTimeouts{0};   // classical sifting timeout count
 };
 struct Act {
   bool     hasPz = false; // if true, apply pZ
@@ -491,7 +493,8 @@ public:
       {"nXX", o.nXX}, {"nZZ", o.nZZ},
       {"qberX", o.qberX}, {"keyBuf", o.keyBuf},
       {"pZtx", o.pZtx}, {"lastBits", o.lastBits},
-      {"winSec", o.winSec}
+      {"winSec", o.winSec}, {"siftRttMs", o.siftRttMs},
+      {"siftTimeouts", o.siftTimeouts}
     };
     auto s = j.dump(); s.push_back('\n');
     return ::send(m_fd, s.data(), s.size(), 0) == (ssize_t) s.size();
@@ -633,6 +636,97 @@ private:
   bool m_mlConnected = false;
 };
 
+// QKD Protocol Message for Classical Post-Processing ------------------------
+struct QkdProtoMsg {
+  uint32_t winId{0}; uint32_t nXX{0}, nZZ{0}; double errX{0}, errZ{0}, qberX{0};
+  uint32_t src{0}, dst{0}; std::string kind;
+  QkdProtoMsg() = default;
+  QkdProtoMsg(uint32_t wid, uint32_t nxx, uint32_t nzz, double ex, double ez, double qx,
+              uint32_t s, uint32_t d, const std::string& k)
+    : winId(wid), nXX(nxx), nZZ(nzz), errX(ex), errZ(ez), qberX(qx), src(s), dst(d), kind(k) {}
+};
+
+// Simple JSON-like serialization for QKD protocol messages
+std::string QkdProtoSerialize(const QkdProtoMsg& m) {
+  std::ostringstream oss;
+  oss << "{\"winId\":" << m.winId << ",\"nXX\":" << m.nXX << ",\"nZZ\":" << m.nZZ
+      << ",\"errX\":" << m.errX << ",\"errZ\":" << m.errZ << ",\"qberX\":" << m.qberX
+      << ",\"src\":" << m.src << ",\"dst\":" << m.dst << ",\"kind\":\"" << m.kind << "\"}";
+  return oss.str();
+}
+
+// Simple JSON-like parsing for QKD protocol messages
+bool QkdProtoParse(const std::string& s, QkdProtoMsg& m) {
+  // Simple string parsing (not full JSON parser)
+  size_t pos = 0;
+  auto findNum = [&](const std::string& key) -> double {
+    size_t start = s.find("\"" + key + "\":", pos);
+    if (start == std::string::npos) return 0;
+    start = s.find(':', start) + 1;
+    size_t end = s.find_first_of(",}", start);
+    return std::stod(s.substr(start, end - start));
+  };
+  auto findStr = [&](const std::string& key) -> std::string {
+    size_t start = s.find("\"" + key + "\":\"", pos);
+    if (start == std::string::npos) return "";
+    start = s.find("\":\"", start) + 3;
+    size_t end = s.find('"', start);
+    return s.substr(start, end - start);
+  };
+  
+  m.winId = findNum("winId"); m.nXX = findNum("nXX"); m.nZZ = findNum("nZZ");
+  m.errX = findNum("errX"); m.errZ = findNum("errZ"); m.qberX = findNum("qberX");
+  m.src = findNum("src"); m.dst = findNum("dst"); m.kind = findStr("kind");
+  return !m.kind.empty();
+}
+
+// QKD: Sifting Application (Alice's SIFT sender with ACK/timeout handling) ----
+class QkdSiftingApp : public Application {
+public:
+  void Configure(Ptr<Node> me, Ipv4Address peer, uint16_t dport, uint8_t dscp,
+                 qkd::SessionManager* sm, qkd::SessionId sid, Time timeout){
+    m_me=me; m_peer=peer; m_dport=dport; m_dscp=dscp; m_sm=sm; m_sid=sid; m_to=timeout;
+  }
+  void BindTx(Ptr<qkd::QkdNetDevice> tx){ m_tx=tx; }
+  void StartApplication() override {
+    m_sock = Socket::CreateSocket(m_me, UdpSocketFactory::GetTypeId());
+    m_sock->SetIpTos(m_dscp); m_sock->Bind();
+    m_sock->SetRecvCallback(MakeCallback(&QkdSiftingApp::OnRecv, this));
+  }
+  void StopApplication() override { if (m_sock){ m_sock->Close(); m_sock=0; } }
+
+  void Kickoff(uint32_t winId){
+    if (!m_tx) return;
+    auto w = m_tx->LastWindow();
+    QkdProtoMsg m{winId,w.nXX,w.nZZ,w.errX,w.errZ,w.qberX,m_sid.src,m_sid.dst,"SIFT"};
+    m_sendAt = Simulator::Now(); m_waiting=winId;
+    std::string s = QkdProtoSerialize(m);
+    m_sock->SendTo(Create<Packet>((uint8_t*)s.c_str(), s.size()), 0, InetSocketAddress(m_peer, m_dport));
+    Simulator::Schedule(m_to, &QkdSiftingApp::OnTimeout, this, winId);
+  }
+
+  // expose classical stats (optional for ML)
+  struct CStats { double rttMs=0; uint32_t timeouts=0; } cstats;
+
+private:
+  void OnRecv(Ptr<Socket> s){
+    Address from; Ptr<Packet> p = s->RecvFrom(from);
+    std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
+    QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="ACK" || m.winId!=m_waiting) return;
+    cstats.rttMs = (Simulator::Now() - m_sendAt).GetMilliSeconds();
+    if (m_sm) m_sm->CloseWindow(m_sid);   // commit bits now
+    m_waiting = 0;
+  }
+  void OnTimeout(uint32_t wid){
+    if (wid!=m_waiting) return;
+    cstats.timeouts++; m_waiting=0;
+    // no CloseWindow() → models classical failure ⇒ 0 bits for this window
+  }
+  Ptr<Node> m_me; Ptr<Socket> m_sock; Ipv4Address m_peer; uint16_t m_dport{9753}; uint8_t m_dscp{0xC0};
+  qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
+  Time m_to{MilliSeconds(50)}; Time m_sendAt; uint32_t m_waiting{0};
+};
+
 // QKD: per-session orchestrator (quantum batches + window close + ML) ----------
 class QkdSessionLoop : public Application {
 public:
@@ -645,6 +739,7 @@ public:
     m_tb=batchPeriod; m_np=pulsesPerBatch; m_tw=windowPeriod;
     m_dyn=dynamicBias; m_ml=ml;
   }
+  void BindSiftingApp(Ptr<QkdSiftingApp> siftApp) { m_siftApp = siftApp; }
   void StartApplication() override {
     m_run=true;
     m_batchEvt = Simulator::ScheduleNow(&QkdSessionLoop::DoBatch, this);
@@ -666,8 +761,14 @@ private:
     // 1) snapshot quantum stats
     m_tx->EndWindow();
 
-    // 2) (for now) commit immediately to SessionManager
-    if (m_sm) m_sm->CloseWindow(m_sid);
+    // 2) send SIFT and wait for ACK before committing (if sifting app available)
+    if (m_siftApp) {
+      m_siftApp->Kickoff(++m_winId);    // send SIFT; sessions.CloseWindow(sAB) runs on ACK
+      // (do NOT call m_sm->CloseWindow here anymore)
+    } else {
+      // fallback: immediate commit (for backward compatibility)
+      if (m_sm) m_sm->CloseWindow(m_sid);
+    }
 
     // 3) optional ML step: maximize SKR (apply to *next* window)
     if (m_dyn && m_ml){
@@ -679,6 +780,11 @@ private:
       ob.nXX = v.nXX; ob.nZZ = v.nZZ; ob.qberX = v.qberX;
       ob.keyBuf = v.buf; ob.pZtx = pZtx;
       ob.lastBits = v.lastBits; ob.winSec = m_tw.GetSeconds();
+      // Add classical stats if sifting app is available
+      if (m_siftApp) {
+        ob.siftRttMs = m_siftApp->cstats.rttMs;
+        ob.siftTimeouts = m_siftApp->cstats.timeouts;
+      }
 
       m_ml->SendObs(ob);
       qkd::Act act;
@@ -687,17 +793,40 @@ private:
       }
     }
 
-    ++m_winId;
     m_winEvt = Simulator::Schedule(m_tw, &QkdSessionLoop::CloseWindow, this);
   }
 
   // wiring
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{};
   Ptr<qkd::QkdNetDevice> m_tx, m_rx;
+  Ptr<QkdSiftingApp> m_siftApp;  // for classical post-processing
   Time m_tb=MilliSeconds(10), m_tw=MilliSeconds(100);
   uint32_t m_np=5000, m_winId=0; bool m_dyn=true;
   qkd::MlBridge* m_ml=nullptr;
   EventId m_batchEvt, m_winEvt; bool m_run=false;
+};
+
+// QKD: Sift Responder (Bob's ACK handler for classical post-processing) --------
+class QkdSiftResponder : public Application {
+public:
+  void Configure(Ptr<Node> me, uint16_t dport){ m_me=me; m_port=dport; }
+  void StartApplication() override {
+    m_sock = Socket::CreateSocket(m_me, UdpSocketFactory::GetTypeId());
+    m_sock->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_port));
+    m_sock->SetRecvCallback(MakeCallback(&QkdSiftResponder::OnRecv, this));
+  }
+  void StopApplication() override { if (m_sock){ m_sock->Close(); m_sock=0; } }
+private:
+  void OnRecv(Ptr<Socket> s){
+    Address from; Ptr<Packet> p = s->RecvFrom(from);
+    std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
+    QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="SIFT") return;
+    // Respond with ACK containing the same window ID
+    QkdProtoMsg ack{m.winId,0,0,0,0,0,m.dst,m.src,"ACK"};
+    std::string ackMsg = QkdProtoSerialize(ack);
+    s->SendTo(Create<Packet>((uint8_t*)ackMsg.c_str(), ackMsg.size()), 0, from);
+  }
+  Ptr<Node> m_me; Ptr<Socket> m_sock; uint16_t m_port{9753};
 };
 } // namespace ns3
 
@@ -2843,33 +2972,46 @@ private:
     sessions.Create(sAB);
     sessions.Bind(sAB, alice, bob);
     
-    // --- QKD Bias Controller Application Setup ---
-    // Create QKD bias controller for per-session bias servo and route management
-    Ptr<QkdBiasController> biasCtrl = CreateObject<QkdBiasController>();
-    biasCtrl->UseSessions(&sessions);
-    biasCtrl->AddPair(sAB, alice, bob);
-    biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000)); // keep this (window cadence)
-
-    // REMOVED legacy rX servo parameters when ML is default:
-    // biasCtrl->SetTargetX(0.10);  // Legacy: Target 10% X-basis detection rate  
-    // biasCtrl->SetGain(0.08);     // Legacy: Servo gain for bias adjustment
+    // --- ML Bridge Setup ---
+    // Build (or reuse) the ML bridge once
+    qkd::MlBridge ml;
+    bool mlOK = false;
+    if (enableMlBridge) mlOK = ml.Connect(mlHost, mlPort);
+    std::cout << "ML bridge " << (mlOK ? "connected" : "not connected") << std::endl;
     
-    // ML on/off decides behavior:
-    biasCtrl->EnableDynamicBias(enableDynamicTuning);
+    // --- QKD Session Loop Application Setup ---
+    // Replace scattered timers with unified per-session orchestrator
+    auto loop = CreateObject<QkdSessionLoop>();
+    ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(loop);
+    loop->Configure(&sessions, sAB, alice, bob,
+                    /*batch*/ MilliSeconds(10), /*pulses*/ qkdPulseRate,
+                    /*window*/ MilliSeconds(qkdWindowSec*1000),
+                    /*dynamicBias*/ enableDynamicTuning,
+                    /*ml*/ (mlOK ? &ml : nullptr));
+    loop->SetStartTime(Seconds(1.0));
+    loop->SetStopTime(Seconds(20.0));
     
-    // Optional ML socket (configurable via --mlHost and --mlPort)
-    if (enableMlBridge) {
-        bool ok = biasCtrl->ConnectMl(mlHost, mlPort);      // use parsed flags
-        std::cout << "ML bridge " << (ok ? "connected" : "not connected (hold pZ)") << std::endl;
-    } else {
-        std::cout << "QKD Bias Controller: Internal control only (dynamic=" << enableDynamicTuning << ")" << std::endl;
-    }
+    // --- QKD Sifting Application Setup for Alice ---
+    // Classical post-processing: Alice sends SIFT and waits for ACK before committing windows
+    auto siftA = CreateObject<QkdSiftingApp>();
+    ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(siftA);
+    siftA->Configure( usingCsv ? hostByIndex[qSrc] : man.host[qSrc],
+                      ifs.GetAddress(qDst), /*port*/9753, /*DSCP*/0xC0,
+                      &sessions, sAB, MilliSeconds(50));
+    siftA->BindTx(alice);
+    siftA->SetStartTime(Seconds(0.9));
+    siftA->SetStopTime(Seconds(20.0));
     
-    // Install bias controller on Alice's node
-    Ptr<Node> biasControllerNode = usingCsv ? hostByIndex[qSrc] : man.host[qSrc];
-    biasControllerNode->AddApplication(biasCtrl);
-    biasCtrl->SetStartTime(Seconds(1.0));  // Start after initial QKD stabilization
-    biasCtrl->SetStopTime(Seconds(20.0));  // Run for simulation duration
+    // Bind sifting app to session loop for window commit coordination
+    loop->BindSiftingApp(siftA);
+    
+    // --- QKD Sift Responder Setup for Bob ---
+    // Classical post-processing: Bob responds to SIFT messages with ACKs
+    auto resp = CreateObject<QkdSiftResponder>();
+    ( usingCsv ? hostByIndex[qDst] : man.host[qDst] )->AddApplication(resp);
+    resp->Configure(( usingCsv ? hostByIndex[qDst] : man.host[qDst] ), 9753); // Listen on port 9753 for SIFT messages
+    resp->SetStartTime(Seconds(1.0));
+    resp->SetStopTime(Seconds(20.0));
     
     // Create and install classical load monitoring application
     Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
@@ -2936,98 +3078,17 @@ private:
       }
     }
 
-    // simple traffic: send batches every 10 ms
-    Simulator::ScheduleNow([alice]{ alice->SendBatch(5000); });
-    Simulator::Schedule(Seconds(0.01), [](){ /* repeat with EventId if you want periodic */ });
+    // --- Removed scattered SendBatch and window timers ---
+    // Now handled by QkdSessionLoop for cleaner orchestration
 
-    // Test QKD implementation
+    // Keep basic functionality tests for validation
     Simulator::Schedule(Seconds(0.1), [alice](){
-      alice->SendBatch(10000);   // send test batch
-      auto stats = alice->GetRollingStats();
-      std::cout << "Alice QKD test: nXX=" << stats.nXX
-                << " nZZ=" << stats.nZZ 
-                << " QBER_X=" << stats.qberX << std::endl;
-      
       // Test new bias control functionality
       alice->SetTxBasisBias(0.8);
       alice->SetRxBasisBias(0.7);
       auto biases = alice->GetBiases();
-      std::cout << "Bias test: Tx=" << biases.first << " Rx=" << biases.second << std::endl;
-      
-      // Test EndWindow and LastWindow functionality
-      alice->EndWindow();
-      auto lastWindow = alice->LastWindow();
-      std::cout << "Last window: nXX=" << lastWindow.nXX << " nZZ=" << lastWindow.nZZ 
-                << " QBER=" << lastWindow.qberX << std::endl;
-      std::cout << "Key buffer: " << alice->Key().Buffer() << " bits, healthy=" 
-                << (alice->Key().Healthy() ? "Y" : "N") << std::endl;
+      std::cout << "Initial bias test: Tx=" << biases.first << " Rx=" << biases.second << std::endl;
     });
-
-    // --- QKD: Enhanced driver with realistic testing modes ---------------------
-    auto batchPeriod = MilliSeconds(10);  // 10ms batch period for realistic timing
-    auto windowPeriod = MilliSeconds(qkdWindowSec * 1000);  // Configurable window period
-
-    // QKD performance tracking (shared_ptr for lambda capture)
-    auto totalKeyBits = std::make_shared<uint32_t>(0);
-    auto totalWindows = std::make_shared<uint32_t>(0);
-    auto avgQber = std::make_shared<double>(0.0);
-    auto failedWindows = std::make_shared<uint32_t>(0);
-
-    // Repeat sender with configurable pulse rate
-    EventId sendEvt;
-    std::function<void()> sendFn = [&](){
-      alice->SendBatch(qkdPulseRate);  // Use configurable pulse rate
-      sendEvt = Simulator::Schedule(batchPeriod, sendFn);
-    };
-    sendFn();
-
-    // Window close + enhanced stats with performance analysis + session tracking
-    EventId winEvt;
-    std::function<void()> winFn = [&, totalKeyBits, totalWindows, avgQber, failedWindows, sAB](){
-      alice->EndWindow();
-      
-      // Update session manager with window closure
-      sessions.CloseWindow(sAB);
-      const auto& v = sessions.View(sAB);
-      
-      auto lastWindow = alice->LastWindow();
-      uint32_t windowBits = alice->Key().LastWindowBits();
-      bool healthy = alice->Key().Healthy();
-      
-      (*totalWindows)++;
-      if (healthy) {
-        *totalKeyBits += windowBits;
-        *avgQber = (*avgQber * (*totalWindows - *failedWindows - 1) + lastWindow.qberX) / (*totalWindows - *failedWindows);
-      } else {
-        (*failedWindows)++;
-      }
-      
-      // Enhanced logging for QKD testing with session information
-      if (enableQkdTesting) {
-        std::cout << "[QKD-" << qkdTestMode << "] Window " << *totalWindows 
-                  << ": bits+=" << windowBits 
-                  << " buf=" << alice->Key().Buffer()
-                  << " healthy=" << (healthy ? "Y" : "N")
-                  << " QBER=" << std::fixed << std::setprecision(4) << lastWindow.qberX
-                  << " nXX=" << lastWindow.nXX << " nZZ=" << lastWindow.nZZ
-                  << " success_rate=" << std::setprecision(2) << (100.0 * (*totalWindows - *failedWindows) / *totalWindows) << "%"
-                  << std::endl;
-        
-        // Additional session view output for detailed analysis
-        double rX = (v.nXX + v.nZZ) ? double(v.nXX) / (v.nXX + v.nZZ) : 0.0;
-        std::cout << "[Session-AB] bits+=" << v.lastBits << " buf=" << v.buf
-                  << " rX=" << std::fixed << std::setprecision(4) << rX
-                  << " qberX=" << v.qberX << std::endl;
-      } else {
-        std::cout << "QKD window: bits+=" << windowBits
-                  << " buf=" << alice->Key().Buffer()
-                  << " healthy=" << (healthy ? "Y" : "N")
-                  << " lastWin(nXX=" << lastWindow.nXX << ",nZZ=" << lastWindow.nZZ << ")" << std::endl;
-      }
-      
-      winEvt = Simulator::Schedule(windowPeriod, winFn);
-    };
-    winFn();
 
     // Optional: feed classical load into the fibre (if you have Mbps)
     // Example: inject classical traffic load for Raman/crosstalk simulation
@@ -3132,18 +3193,19 @@ private:
     if (enableQkdTesting) {
       std::cout << "\n=== QKD Performance Summary (" << qkdTestMode << " mode) ===" << std::endl;
       double simTime = (enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : 15.0));
-      double keyRate = *totalKeyBits / simTime;  // bits per second
-      double successRate = *totalWindows > 0 ? 100.0 * (*totalWindows - *failedWindows) / *totalWindows : 0.0;
+      
+      // Get final statistics from session manager and devices
+      const auto& v = sessions.View(sAB);
+      uint32_t finalKeyBits = alice->Key().Buffer();
+      double keyRate = finalKeyBits / simTime;  // bits per second
       
       std::cout << "Simulation duration: " << simTime << "s" << std::endl;
-      std::cout << "Total key bits generated: " << *totalKeyBits << " bits" << std::endl;
+      std::cout << "Final key buffer: " << finalKeyBits << " bits" << std::endl;
       std::cout << "Average key rate: " << std::fixed << std::setprecision(1) << keyRate << " bps" << std::endl;
-      std::cout << "Window success rate: " << std::setprecision(2) << successRate << "% (" 
-                << (*totalWindows - *failedWindows) << "/" << *totalWindows << ")" << std::endl;
-      std::cout << "Average QBER: " << std::setprecision(4) << *avgQber << std::endl;
-      std::cout << "Final key buffer: " << alice->Key().Buffer() << " bits" << std::endl;
+      std::cout << "Session QBER: " << std::setprecision(4) << v.qberX << std::endl;
+      std::cout << "Session nXX: " << v.nXX << ", nZZ: " << v.nZZ << std::endl;
       
-      // Performance assessment
+      // Performance assessment based on key rate
       if (keyRate > 1000) {
         std::cout << "Performance: EXCELLENT (>1kbps)" << std::endl;
       } else if (keyRate > 100) {
@@ -3154,11 +3216,12 @@ private:
         std::cout << "Performance: POOR (<10bps)" << std::endl;
       }
       
-      if (*avgQber < 0.02) {
+      // Security assessment based on QBER
+      if (v.qberX < 0.02) {
         std::cout << "Security: EXCELLENT (QBER < 2%)" << std::endl;
-      } else if (*avgQber < 0.05) {
+      } else if (v.qberX < 0.05) {
         std::cout << "Security: GOOD (QBER < 5%)" << std::endl;
-      } else if (*avgQber < 0.11) {
+      } else if (v.qberX < 0.11) {
         std::cout << "Security: MARGINAL (QBER < 11%)" << std::endl;
       } else {
         std::cout << "Security: COMPROMISED (QBER >= 11%)" << std::endl;
