@@ -419,7 +419,7 @@ struct SessionView {
 
 class SessionManager {
 public:
-  void Create(SessionId s) { m_map.emplace(s, Entry{}); }
+  void Create(SessionId s) { m_map.emplace(s, Entry{}); m_lastCommitted[s] = 0; }
   void Bind(SessionId s, Ptr<QkdNetDevice> tx, Ptr<QkdNetDevice> rx) { 
     auto& e=m_map[s]; e.tx=tx; e.rx=rx; 
   }
@@ -435,6 +435,19 @@ public:
     e.view.nZZ = w.nZZ; 
     e.view.qberX = w.qberX;
   }
+  void CloseWindow(SessionId s, uint32_t wid){
+    auto it = m_map.find(s);
+    if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
+    if (m_lastCommitted[s] == wid) return; // idempotent - already committed this window
+
+    auto& e = it->second;
+    const auto& w = e.tx->LastWindow();
+    e.km.Update(w.nXX, w.nZZ, w.qberX);
+    e.view.buf = e.km.Buffer();
+    e.view.lastBits = e.km.LastWindowBits();
+    e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.qberX = w.qberX;
+    m_lastCommitted[s] = wid;
+  }
   uint32_t Drain(SessionId s, uint32_t n){ 
     return m_map[s].km.Drain(n); 
   }
@@ -448,6 +461,7 @@ private:
     SessionView view; 
   };
   std::map<SessionId, Entry> m_map;
+  std::map<SessionId, uint32_t> m_lastCommitted;  // track per-session last committed wid
 };
 
 }} // ns3::qkd
@@ -727,9 +741,10 @@ private:
     Address from; Ptr<Packet> p = s->RecvFrom(from);
     std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
     QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="ACK" || m.winId!=m_waiting) return;
-    std::cout << "DEBUG: SIFT ACK received winId=" << m.winId << ", calling CloseWindow" << std::endl;
+    std::cout << "DEBUG: SIFT ACK received winId=" << m.winId << ", updating RTT telemetry" << std::endl;
     cstats.rttMs = (Simulator::Now() - m_sendAt).GetMilliSeconds();
-    if (m_sm) m_sm->CloseWindow(m_sid);   // commit bits now
+    // Dedupe by wid: commit was already done optimistically on window close
+    if (m_sm) m_sm->CloseWindow(m_sid, m.winId);  // wid-aware, idempotent
     m_waiting = 0;
     m_retries = 0;
   }
@@ -783,9 +798,12 @@ private:
     std::cout << "DEBUG: CloseWindow() at t=" << Simulator::Now().GetSeconds() << "s" << std::endl;
     // 1) snapshot quantum stats
     m_tx->EndWindow();
-
-    // 2) Kick off classical sifting for this window; commit happens on ACK
     ++m_winId;
+
+    // 2) Optimistic commit immediately (commit-on-close with dedupe)
+    if (m_sm) m_sm->CloseWindow(m_sid, m_winId);   // commit immediately, idempotent by wid
+
+    // 3) Kick off classical sifting for this window; ACK will update RTT/timeout telemetry only
     if (m_siftApp && !m_siftApp->Busy()) {
       m_siftApp->Kickoff(m_winId);
     } else {
@@ -1769,11 +1787,6 @@ protected:
     DpctlOrWarn("QoS-ARP", dpid,
                 "flow-mod cmd=add,table=0,prio=250 eth_type=0x0806 goto:1");
     
-    // Optional: Create meter to police BE traffic at 80 Mbps
-    // This protects control traffic under heavy load conditions
-    // NOTE: Temporarily disabled due to OFSwitch13 meter parsing issues
-    // DpctlOrWarn("Meter-BE", dpid, "meter-mod cmd=add,meter=5 kbps,rate=80000");
-    
     // Table 0 miss -> goto table 1 (pass-through for safety)
     DpctlOrWarn("QoS-Table0-Miss", dpid, 
                 "flow-mod cmd=add,table=0,prio=0 goto:1");
@@ -1816,33 +1829,19 @@ protected:
            << " apply:output=" << outPort;
     DpctlOrWarn("ARP", dpid, arpCmd.str());
 
-    // Install CS6 (DSCP=48) IPv4 rule with high priority queue (Q0) in table 1
+    // Install CS6 (DSCP=48) IPv4 rule with high priority in table 1
     std::ostringstream cs6Cmd;
     cs6Cmd << "flow-mod cmd=add,table=1,prio=300"
            << " eth_type=0x0800,ip_dscp=48,eth_dst=" << host.mac
-           << " apply:set_queue=0,output=" << outPort;
+           << " apply:output=" << outPort;
     DpctlOrWarn("IPv4-CS6", dpid, cs6Cmd.str());
 
-    // Install BE policing meter (80 Mbps limit)
-    uint32_t meterId = 5 + (outPort % 100); // Unique meter per port
-    std::ostringstream meterCmd;
-    meterCmd << "meter-mod cmd=add,meter=" << meterId << " kbps,rate=80000";
-    DpctlOrWarn("Meter-BE", dpid, meterCmd.str());
-
-    // Install default IPv4 rule with low priority queue (Q2) and meter in table 1  
+    // Install default IPv4 rule with lower priority in table 1  
     // This catches all non-CS6 traffic (BE and other DSCP values)
     std::ostringstream ipCmd;
-    if (m_enableEnhancedQoS) {
-      // With meter policing for BE traffic
-      ipCmd << "flow-mod cmd=add,table=1,prio=100"
-            << " eth_type=0x0800,eth_dst=" << host.mac
-            << " meter:" << meterId << ",apply:set_queue=2,output=" << outPort;
-    } else {
-      // Fallback without meter (for compatibility)
-      ipCmd << "flow-mod cmd=add,table=1,prio=100"
-            << " eth_type=0x0800,eth_dst=" << host.mac
-            << " apply:set_queue=2,output=" << outPort;
-    }
+    ipCmd << "flow-mod cmd=add,table=1,prio=100"
+          << " eth_type=0x0800,eth_dst=" << host.mac
+          << " apply:output=" << outPort;
     DpctlOrWarn("IPv4-BE", dpid, ipCmd.str());
   }
 
@@ -1882,32 +1881,18 @@ protected:
                    << " apply:output=" << paths[i].nextHop;
             DpctlOrWarn("ARP-MP", dpid, arpCmd.str());
 
-            // Install CS6 (DSCP=48) IPv4 rule with high priority queue (Q0) for this path
+            // Install CS6 (DSCP=48) IPv4 rule with high priority for this path
             std::ostringstream cs6Cmd;
             cs6Cmd << "flow-mod cmd=add,table=1,prio=" << (pathPrio + 200) // CS6 gets higher priority
                    << " eth_type=0x0800,ip_dscp=48,eth_dst=" << host.mac
-                   << " apply:set_queue=0,output=" << paths[i].nextHop;
+                   << " apply:output=" << paths[i].nextHop;
             DpctlOrWarn("IPv4-CS6-MP", dpid, cs6Cmd.str());
 
-            // Install BE policing meter for this path (80 Mbps limit)
-            uint32_t meterId = 5 + (paths[i].nextHop % 100) + (i * 10); // Unique meter per path
-            std::ostringstream meterCmd;
-            meterCmd << "meter-mod cmd=add,meter=" << meterId << " kbps,rate=80000";
-            DpctlOrWarn("Meter-BE-MP", dpid, meterCmd.str());
-
-            // Install BE (default) IPv4 rule with low priority queue (Q2) and meter for this path
+            // Install BE (default) IPv4 rule with lower priority for this path
             std::ostringstream beCmd;
-            if (m_enableEnhancedQoS) {
-              // With meter policing for BE traffic
-              beCmd << "flow-mod cmd=add,table=1,prio=" << pathPrio
-                    << " eth_type=0x0800,eth_dst=" << host.mac
-                    << " meter:" << meterId << ",apply:set_queue=2,output=" << paths[i].nextHop;
-            } else {
-              // Fallback without meter (for compatibility)
-              beCmd << "flow-mod cmd=add,table=1,prio=" << pathPrio
-                    << " eth_type=0x0800,eth_dst=" << host.mac
-                    << " apply:set_queue=2,output=" << paths[i].nextHop;
-            }
+            beCmd << "flow-mod cmd=add,table=1,prio=" << pathPrio
+                  << " eth_type=0x0800,eth_dst=" << host.mac
+                  << " apply:output=" << paths[i].nextHop;
             DpctlOrWarn("IPv4-BE-MP", dpid, beCmd.str());
           }
           
@@ -2125,12 +2110,20 @@ private:
                << " apply:output=" << outPort;
         flows.push_back(arpCmd.str());
 
-        // Create IPv4 rule command  
-        std::ostringstream ipCmd;
-        ipCmd << "flow-mod cmd=add,table=1,prio=100"
-               << " eth_type=0x0800,eth_dst=" << host.mac
-               << " apply:output=" << outPort;
-        flows.push_back(ipCmd.str());
+        // Create IPv4 CS6 rule command (high priority)
+        std::ostringstream ipCs6Cmd;
+        ipCs6Cmd << "flow-mod cmd=add,table=1,prio=300"
+                 << " eth_type=0x0800,ip_dscp=48,eth_dst=" << host.mac
+                 << " apply:output=" << outPort;
+        flows.push_back(ipCs6Cmd.str());
+        NS_LOG_DEBUG("RealisticController: CS6 flow for " << host.ip << " -> " << ipCs6Cmd.str());
+
+        // Create IPv4 BE rule command (lower priority)
+        std::ostringstream ipBeCmd;
+        ipBeCmd << "flow-mod cmd=add,table=1,prio=100"
+                << " eth_type=0x0800,eth_dst=" << host.mac
+                << " apply:output=" << outPort;
+        flows.push_back(ipBeCmd.str());
         
       } else {
         auto paths = ComputeKShortestPaths(dpid, host.edgeSw, m_multiPathEnabled ? m_maxPaths : 1);
@@ -2150,12 +2143,19 @@ private:
                  << " apply:output=" << outPort;
           flows.push_back(arpCmd.str());
 
-          // Create IPv4 rule command  
-          std::ostringstream ipCmd;
-          ipCmd << "flow-mod cmd=add,table=1,prio=100"
-                 << " eth_type=0x0800,eth_dst=" << host.mac
-                 << " apply:output=" << outPort;
-          flows.push_back(ipCmd.str());
+          // Create IPv4 CS6 rule command (high priority)
+          std::ostringstream ipCs6Cmd;
+          ipCs6Cmd << "flow-mod cmd=add,table=1,prio=300"
+                   << " eth_type=0x0800,ip_dscp=48,eth_dst=" << host.mac
+                   << " apply:output=" << outPort;
+          flows.push_back(ipCs6Cmd.str());
+
+          // Create IPv4 BE rule command (lower priority)
+          std::ostringstream ipBeCmd;
+          ipBeCmd << "flow-mod cmd=add,table=1,prio=100"
+                  << " eth_type=0x0800,eth_dst=" << host.mac
+                  << " apply:output=" << outPort;
+          flows.push_back(ipBeCmd.str());
           
         } else {
           // Multiple paths: use priority-based failover instead of groups
@@ -2170,12 +2170,19 @@ private:
                    << " apply:output=" << paths[i].nextHop;
             flows.push_back(arpCmd.str());
 
-            // Create IPv4 rule command
-            std::ostringstream ipCmd;
-            ipCmd << "flow-mod cmd=add,table=1,prio=" << priority
-                  << " eth_type=0x0800,eth_dst=" << host.mac
-                  << " apply:output=" << paths[i].nextHop;
-            flows.push_back(ipCmd.str());
+            // Create IPv4 CS6 rule command (high priority)
+            std::ostringstream ipCs6Cmd;
+            ipCs6Cmd << "flow-mod cmd=add,table=1,prio=" << (priority + 200)
+                     << " eth_type=0x0800,ip_dscp=48,eth_dst=" << host.mac
+                     << " apply:output=" << paths[i].nextHop;
+            flows.push_back(ipCs6Cmd.str());
+
+            // Create IPv4 BE rule command (lower priority)
+            std::ostringstream ipBeCmd;
+            ipBeCmd << "flow-mod cmd=add,table=1,prio=" << priority
+                    << " eth_type=0x0800,eth_dst=" << host.mac
+                    << " apply:output=" << paths[i].nextHop;
+            flows.push_back(ipBeCmd.str());
           }
         }
       }
@@ -2582,12 +2589,15 @@ private:
     // Best-effort parameters
     std::string beRate = "10Mbps";  // Reduced from 50Mbps to prevent overwhelming
     
+    // Traffic shaping parameters
+    std::string tbfRate = "80Mbps";  // TBF rate limit for background traffic hosts
+    
     // Topology parameters
     std::string topoPath = "";
     bool enableRing = false;
     
     // Queue parameters - optimized for load testing with switch egress queuing
-    uint32_t qdiscMaxP = 300, txQueueMaxP = 200;  // Recommended for load runs
+    uint32_t qdiscMaxP = 1000, txQueueMaxP = 200;  // Increased headroom for CS6 band
     uint32_t qdiscPollMs = 20; // Higher default for scalability on larger topologies
     bool qdiscOnSwitch = true; // Switch-egress contention modeling ENABLED for load testing
     
@@ -2628,6 +2638,7 @@ private:
     cmd.AddValue("qkdDur", "QKD window duration (s)", qkdDur);
     cmd.AddValue("qkdPps", "QKD packets per second", qkdPps);
     cmd.AddValue("beRate", "Best-effort data rate", beRate);
+    cmd.AddValue("tbfRate", "TBF rate limit for background traffic hosts", tbfRate);
     cmd.AddValue("enableQkdTesting", "Enable comprehensive QKD performance testing", enableQkdTesting);
     cmd.AddValue("qkdPulseRate", "QKD pulse rate (pulses per 10ms window)", qkdPulseRate);
     cmd.AddValue("qkdWindowSec", "QKD key generation window duration (seconds)", qkdWindowSec);
@@ -2909,13 +2920,16 @@ private:
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> fm = fmHelper.InstallAll();
 
-    // ---------------- QoS: ensure PfifoFast (priority-aware) on host NICs ----------------
-    TrafficControlHelper tch;
+    // ---------------- QoS: Traffic Shaping with TBF for Background Hosts ----------------
+    // QKD endpoints (qSrc, qDst) get PfifoFast for strict priority
+    // All other hosts get TBF to limit background traffic rate
+    
+    TrafficControlHelper pfifo;
     if (PfifoHasLimitAttr()) {
-      tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc",
+      pfifo.SetRootQueueDisc("ns3::PfifoFastQueueDisc",
                            "Limit", UintegerValue(qdiscMaxP));
     } else {
-      tch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
+      pfifo.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
       NS_LOG_INFO("PfifoFast has no 'Limit' attribute in this build; using defaults");
     }
 
@@ -2929,9 +2943,23 @@ private:
       if (Ptr<QueueDisc> existing = tcl ? tcl->GetRootQueueDiscOnDevice(dev) : nullptr) {
         tcl->DeleteRootQueueDiscOnDevice(dev);
       }
-      
-      // Install fresh PfifoFast with specified Limit
-      QueueDiscContainer c = tch.Install(NetDeviceContainer(dev));
+
+      QueueDiscContainer c;
+      if (i == qSrc || i == qDst) {
+        // QKD endpoints keep strict-priority (pfifo_fast honors DSCP precedence -> CS6 band)
+        c = pfifo.Install(NetDeviceContainer(dev));
+        NS_LOG_INFO("Installed PfifoFast on QKD endpoint host " << i << " (node " << 
+                   dev->GetNode()->GetId() << ")");
+      } else {
+        // Background traffic hosts get TBF rate limiting
+        TrafficControlHelper tbf;
+        tbf.SetRootQueueDisc("ns3::TbfQueueDisc",
+                             "Rate", DataRateValue(DataRate(tbfRate)),
+                             "Burst", UintegerValue(64*1024));
+        c = tbf.Install(NetDeviceContainer(dev));
+        NS_LOG_INFO("Installed TbfQueueDisc (rate=" << tbfRate << ") on background host " << i << 
+                   " (node " << dev->GetNode()->GetId() << ")");
+      }
       hostQdiscs.Add(c.Get(0));
     }
 
@@ -3002,6 +3030,9 @@ private:
     // Safety check: ensure QKD source/destination are valid
     NS_ABORT_MSG_IF(qSrc >= numHosts || qDst >= numHosts,
       "qSrc/qDst out of range for number of hosts (" << numHosts << ")");
+    
+    NS_LOG_INFO("Traffic Shaping Config: QKD endpoints (hosts " << qSrc << "," << qDst << 
+               ") get PfifoFast, " << (numHosts-2) << " background hosts get TBF@" << tbfRate);
     
     // Safety check: ensure even host count for proper pairing
     NS_ABORT_MSG_IF(numHosts % 2 != 0,
@@ -3134,9 +3165,20 @@ private:
                     /*window*/ MilliSeconds(qkdWindowSec*1000),
                     /*dynamicBias*/ enableDynamicTuning,
                     /*ml*/ (mlOK ? &ml : nullptr));
+    // Let the sim run past the last window/ACK
+    const double simEnd = 20.5;
     loop->SetStartTime(Seconds(1.0));
-    loop->SetStopTime(Seconds(20.0));
+    loop->SetStopTime(Seconds(simEnd - 0.1));
     
+    // --- QKD Sift Responder Setup for Bob ---
+    // Classical post-processing: Bob responds to SIFT messages with ACKs
+    // Start responder before sender to ensure ACKs can arrive
+    auto resp = CreateObject<QkdSiftResponder>();
+    ( usingCsv ? hostByIndex[qDst] : man.host[qDst] )->AddApplication(resp);
+    resp->Configure(( usingCsv ? hostByIndex[qDst] : man.host[qDst] ), 9753, /*CS6*/ 0xC0); // Listen on port 9753 for SIFT messages with CS6 priority
+    resp->SetStartTime(Seconds(0.8));
+    resp->SetStopTime(Seconds(simEnd - 0.1));
+
     // --- QKD Sifting Application Setup for Alice ---
     // Classical post-processing: Alice sends SIFT and waits for ACK before committing windows
     auto siftA = CreateObject<QkdSiftingApp>();
@@ -3146,18 +3188,10 @@ private:
                       &sessions, sAB, MilliSeconds(200));
     siftA->BindTx(alice);
     siftA->SetStartTime(Seconds(0.9));
-    siftA->SetStopTime(Seconds(20.0));
+    siftA->SetStopTime(Seconds(simEnd - 0.1));
     
     // Bind sifting app to session loop for window commit coordination
     loop->BindSiftingApp(siftA);
-    
-    // --- QKD Sift Responder Setup for Bob ---
-    // Classical post-processing: Bob responds to SIFT messages with ACKs
-    auto resp = CreateObject<QkdSiftResponder>();
-    ( usingCsv ? hostByIndex[qDst] : man.host[qDst] )->AddApplication(resp);
-    resp->Configure(( usingCsv ? hostByIndex[qDst] : man.host[qDst] ), 9753, /*CS6*/ 0xC0); // Listen on port 9753 for SIFT messages with CS6 priority
-    resp->SetStartTime(Seconds(1.0));
-    resp->SetStopTime(Seconds(20.0));
     
     // Create and install classical load monitoring application
     Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
@@ -3275,7 +3309,7 @@ private:
       });
     }
 
-    Simulator::Stop(Seconds(enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : 15.0)));  // Extended time for testing scenarios
+    Simulator::Stop(Seconds(enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : simEnd)));  // Extended time for testing scenarios
     Simulator::Run();
     
     // FlowMonitor telemetry output
