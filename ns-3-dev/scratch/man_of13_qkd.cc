@@ -697,7 +697,10 @@ public:
   void BindTx(Ptr<qkd::QkdNetDevice> tx){ m_tx=tx; }
   void StartApplication() override {
     m_sock = Socket::CreateSocket(m_me, UdpSocketFactory::GetTypeId());
-    m_sock->SetIpTos(m_dscp); m_sock->Bind();
+    m_sock->SetIpTos(m_dscp);
+    m_sock->SetPriority(6);
+    // Note: UDP sockets don't support TCP-specific buffer size attributes
+    m_sock->Bind();
     m_sock->SetRecvCallback(MakeCallback(&QkdSiftingApp::OnRecv, this));
   }
   void StopApplication() override { if (m_sock){ m_sock->Close(); m_sock=0; } }
@@ -731,16 +734,16 @@ private:
   void OnTimeout(uint32_t wid){
     if (wid!=m_waiting) return;
     cstats.timeouts++; m_waiting=0;
-    // one simple retry
-    if (m_retries < 1) {
+    // Enhanced retry with backoff
+    if (m_retries < m_maxRetries) {
       ++m_retries;
-      Simulator::Schedule(MilliSeconds(5), &QkdSiftingApp::Kickoff, this, wid);
+      Simulator::Schedule(m_backoff * m_retries, &QkdSiftingApp::Kickoff, this, wid);
     }
   }
   Ptr<Node> m_me; Ptr<Socket> m_sock; Ipv4Address m_peer; uint16_t m_dport{9753}; uint8_t m_dscp{0xC0};
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
   Time m_to{MilliSeconds(50)}; Time m_sendAt; uint32_t m_waiting{0};
-  uint32_t m_retries{0};
+  uint32_t m_retries{0}; uint32_t m_maxRetries{3}; Time m_backoff{MilliSeconds(20)};
 };
 
 // QKD: per-session orchestrator (quantum batches + window close + ML) ----------
@@ -828,11 +831,14 @@ private:
 // QKD: Sift Responder (Bob's ACK handler for classical post-processing) --------
 class QkdSiftResponder : public Application {
 public:
-  void Configure(Ptr<Node> me, uint16_t dport){ m_me=me; m_port=dport; }
+  void Configure(Ptr<Node> me, uint16_t dport, uint8_t dscp = 0xC0){ m_me=me; m_port=dport; m_dscp=dscp; }
   void StartApplication() override {
     m_sock = Socket::CreateSocket(m_me, UdpSocketFactory::GetTypeId());
     m_sock->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_port));
     m_sock->SetRecvCallback(MakeCallback(&QkdSiftResponder::OnRecv, this));
+    m_sock->SetIpTos(m_dscp);
+    m_sock->SetPriority(6);
+    // Note: UDP sockets don't support TCP-specific buffer size attributes
   }
   void StopApplication() override { if (m_sock){ m_sock->Close(); m_sock=0; } }
 private:
@@ -846,7 +852,7 @@ private:
     std::string ackMsg = QkdProtoSerialize(ack);
     s->SendTo(Create<Packet>((uint8_t*)ackMsg.c_str(), ackMsg.size()), 0, from);
   }
-  Ptr<Node> m_me; Ptr<Socket> m_sock; uint16_t m_port{9753};
+  Ptr<Node> m_me; Ptr<Socket> m_sock; uint16_t m_port{9753}; uint8_t m_dscp{0xC0};
 };
 } // namespace ns3
 
@@ -1676,6 +1682,7 @@ public:
   
   void SetQoSConfig(bool enabled) {
     m_qosEnabled = enabled;
+    m_routeTable = m_qosEnabled ? 1u : 0u;
   }
 
   // (no-op: remapping done in main now)
@@ -1705,7 +1712,12 @@ protected:
 
   void InstallRealisticQoS(uint64_t dpid) {
     if (!m_qosEnabled) {
-      NS_LOG_DEBUG("QoS disabled for switch " << dpid);
+      NS_LOG_DEBUG("QoS disabled for switch " << dpid << " - installing pass-through rules");
+      // Install pass-through rules from table 0 to table 1 when QoS is disabled
+      DpctlOrWarn("PT-ARP",  dpid, "flow-mod cmd=add,table=0,prio=250 eth_type=0x0806 goto:1");
+      DpctlOrWarn("PT-IP",   dpid, "flow-mod cmd=add,table=0,prio=100 eth_type=0x0800 goto:1");
+      DpctlOrWarn("PT-MISS", dpid, "flow-mod cmd=add,table=0,prio=0 goto:1");
+      DpctlOrWarn("T1-MISS", dpid, "flow-mod cmd=add,table=1,prio=0 apply:");
       return;
     }
 
@@ -1969,6 +1981,7 @@ protected:
   bool m_multiPathEnabled{true};
   uint32_t m_maxPaths{3};
   bool m_qosEnabled{true};
+  uint32_t m_routeTable{1};  // 1 with QoS, 0 without (for future use)
 
 private:
   std::set<std::pair<Sw,Sw>> m_warnedNoPath;
@@ -2932,6 +2945,15 @@ private:
       warm.Install(man.host[qSrc]);
     }
 
+    // Reverse ARP warmup: ensure ACK responses have ARP cache entries
+    V4PingHelper warmBack(ifs.GetAddress(qSrc));
+    warmBack.SetAttribute("StartTime", TimeValue(Seconds(0.21)));
+    if (usingCsv) {
+      warmBack.Install(hostByIndex[qDst]);
+    } else {
+      warmBack.Install(man.host[qDst]);
+    }
+
     // --- old bulk EF QKD window (commented out) ---
     // Ptr<QkdWindowApp> qkd = CreateObject<QkdWindowApp>();
     // if (usingCsv) {
@@ -3032,7 +3054,7 @@ private:
     // Classical post-processing: Bob responds to SIFT messages with ACKs
     auto resp = CreateObject<QkdSiftResponder>();
     ( usingCsv ? hostByIndex[qDst] : man.host[qDst] )->AddApplication(resp);
-    resp->Configure(( usingCsv ? hostByIndex[qDst] : man.host[qDst] ), 9753); // Listen on port 9753 for SIFT messages
+    resp->Configure(( usingCsv ? hostByIndex[qDst] : man.host[qDst] ), 9753, /*CS6*/ 0xC0); // Listen on port 9753 for SIFT messages with CS6 priority
     resp->SetStartTime(Seconds(1.0));
     resp->SetStopTime(Seconds(20.0));
     
