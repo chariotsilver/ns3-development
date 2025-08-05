@@ -37,6 +37,11 @@
 using namespace ns3;
 using nlohmann::json;
 
+// Global flag to control ML observation source
+// When true, observations come only from ACK-based OnRecv (recommended)
+// When false, BiasController also sends observations (legacy mode)
+static bool g_obsFromSiftingOnly = true;
+
 // QKD: Fiber channel (shared span, WDM-aware)
 namespace ns3 { namespace qkd {
 
@@ -637,7 +642,9 @@ private:
         ob.pZtx = pZtx;
 
         if (m_mlConnected) { 
-          m_ml.SendObs(ob); 
+          if (!g_obsFromSiftingOnly) {
+            m_ml.SendObs(ob); // only if not using sifting-based obs
+          }
         }
 
         qkd::Act act;
@@ -2128,6 +2135,15 @@ public:
     m_processingRng = CreateObject<UniformRandomVariable>();
     m_processingRng->SetAttribute("Min", DoubleValue(2.0));
     m_processingRng->SetAttribute("Max", DoubleValue(8.0));
+    m_qkdSrcHostIdx = UINT32_MAX; // Invalid by default
+    m_qkdDstHostIdx = UINT32_MAX; // Invalid by default
+  }
+
+  // Configure QKD-specific host indices for ultra-explicit rules
+  void SetQkdHosts(uint32_t srcIdx, uint32_t dstIdx) {
+    m_qkdSrcHostIdx = srcIdx;
+    m_qkdDstHostIdx = dstIdx;
+    NS_LOG_INFO("QKD hosts configured: src=" << srcIdx << " dst=" << dstIdx);
   }
 
 protected:
@@ -2184,6 +2200,29 @@ private:
         // Direct delivery to host - simple flows in table 1
         Port outPort = host.edgePort;
         
+        // **ULTRA-EXPLICIT QKD RULES (Priority 320) - Never compete with BE**
+        // Add explicit QKD rules for QKD destination host only
+        if (m_qkdDstHostIdx != UINT32_MAX && m_qkdSrcHostIdx != UINT32_MAX) {
+          // Find QKD destination host by comparing with host index
+          bool isQkdDst = false;
+          for (size_t i = 0; i < m_hosts.size(); ++i) {
+            if (&m_hosts[i] == &host && i == m_qkdDstHostIdx) {
+              isQkdDst = true;
+              break;
+            }
+          }
+          
+          if (isQkdDst) {
+            // Ultra-specific rule: IPv4 + CS6 + UDP + port 9753 + exact MAC
+            std::ostringstream qkdCmd;
+            qkdCmd << "flow-mod cmd=add,table=1,prio=320"
+                   << " eth_type=0x0800,ip_dscp=48,ip_proto=17,udp_dst=9753,eth_dst=" << host.mac
+                   << " apply:output=" << outPort;
+            flows.push_back(qkdCmd.str());
+            NS_LOG_INFO("Added ultra-explicit QKD rule for host " << host.ip << " -> " << qkdCmd.str());
+          }
+        }
+        
         // Create ARP rule command
         std::ostringstream arpCmd;
         arpCmd << "flow-mod cmd=add,table=1,prio=200"
@@ -2217,6 +2256,26 @@ private:
           // Single path: traditional flows in table 1
           Port outPort = paths[0].nextHop;
           
+          // **ULTRA-EXPLICIT QKD RULES (Priority 320) - Never compete with BE**
+          if (m_qkdDstHostIdx != UINT32_MAX && m_qkdSrcHostIdx != UINT32_MAX) {
+            bool isQkdDst = false;
+            for (size_t i = 0; i < m_hosts.size(); ++i) {
+              if (&m_hosts[i] == &host && i == m_qkdDstHostIdx) {
+                isQkdDst = true;
+                break;
+              }
+            }
+            
+            if (isQkdDst) {
+              std::ostringstream qkdCmd;
+              qkdCmd << "flow-mod cmd=add,table=1,prio=320"
+                     << " eth_type=0x0800,ip_dscp=48,ip_proto=17,udp_dst=9753,eth_dst=" << host.mac
+                     << " apply:output=" << outPort;
+              flows.push_back(qkdCmd.str());
+              NS_LOG_INFO("Added ultra-explicit QKD rule (single-path) for host " << host.ip);
+            }
+          }
+          
           // Create ARP rule command
           std::ostringstream arpCmd;
           arpCmd << "flow-mod cmd=add,table=1,prio=200"
@@ -2241,6 +2300,32 @@ private:
         } else {
           // Multiple paths: use priority-based failover instead of groups
           // Install flows in decreasing priority order (highest priority = primary path)
+          
+          // **ULTRA-EXPLICIT QKD RULES (Priority 320+) - Multi-path with failover**
+          if (m_qkdDstHostIdx != UINT32_MAX && m_qkdSrcHostIdx != UINT32_MAX) {
+            bool isQkdDst = false;
+            for (size_t i = 0; i < m_hosts.size(); ++i) {
+              if (&m_hosts[i] == &host && i == m_qkdDstHostIdx) {
+                isQkdDst = true;
+                break;
+              }
+            }
+            
+            if (isQkdDst) {
+              // Install ultra-explicit QKD rules for each path with decreasing priority
+              for (size_t i = 0; i < paths.size(); ++i) {
+                uint32_t qkdPrio = 320 - i; // Primary=320, backup1=319, backup2=318...
+                std::ostringstream qkdCmd;
+                qkdCmd << "flow-mod cmd=add,table=1,prio=" << qkdPrio
+                       << " eth_type=0x0800,ip_dscp=48,ip_proto=17,udp_dst=9753,eth_dst=" << host.mac
+                       << " apply:output=" << paths[i].nextHop;
+                flows.push_back(qkdCmd.str());
+              }
+              NS_LOG_INFO("Added ultra-explicit QKD rules (multi-path) for host " << host.ip 
+                         << " with " << paths.size() << " paths");
+            }
+          }
+          
           for (size_t i = 0; i < paths.size(); ++i) {
             uint32_t priority = 150 - i; // Primary=150, backup1=149, backup2=148...
             
@@ -2294,6 +2379,8 @@ private:
 private:
   Time m_controlPlaneDelay;
   Ptr<UniformRandomVariable> m_processingRng;
+  uint32_t m_qkdSrcHostIdx;
+  uint32_t m_qkdDstHostIdx;
 };
 
 // Telemetry callbacks for queue monitoring
@@ -2920,6 +3007,16 @@ private:
     // (B) Install controller object (no learning controller)
     of13->InstallController(controllerNode, ctrl);
     std::cout << "DEBUG: Installed controller" << std::endl;
+
+    // Configure QKD hosts for ultra-explicit OpenFlow rules
+    if (realisticController) {
+      Ptr<RealisticController> rCtrl = DynamicCast<RealisticController>(ctrl);
+      if (rCtrl) {
+        rCtrl->SetQkdHosts(qSrc, qDst);
+        std::cout << "DEBUG: Configured QKD hosts (src=" << qSrc << ", dst=" << qDst 
+                  << ") for ultra-explicit OpenFlow rules" << std::endl;
+      }
+    }
 
     // (C) Install Internet + assign IPs
     InternetStackHelper internet;
