@@ -8,6 +8,7 @@
 #include "ns3/traffic-control-layer.h"
 #include "ns3/pfifo-fast-queue-disc.h"
 #include "ns3/queue-size.h"
+#include <unordered_map>
 #include "ns3/ofswitch13-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/random-variable-stream.h"
@@ -53,6 +54,7 @@ public:
 private:
   struct Port { Ptr<NetDevice> dev; double lambdaNm; double mbps=0.0; };
   std::vector<Port> m_ports;
+  std::unordered_map<double,double> m_sidebandLoads; // λ -> Mbps (no attached dev required)
   std::mt19937 m_rng{0xBADC0DE};                              // reproducible RNG
   double m_lenKm=10.0, m_lossDb=4.0, m_depol0=1e-4, m_k=5e-4, m_sigmaNm=10.0;
   double ExtraDepol(double lambdaNm) const;                   // Gaussian vs |Δλ|
@@ -115,7 +117,6 @@ public:
   
   void EndWindow(){
     m_last = m_stats;                                    // snapshot window
-    m_key.Update(m_stats.nXX, m_stats.nZZ, m_stats.qberX);
     m_stats = QkdStats{};                                // reset for next window
   }
   qkd::QkdKeyManager& Key(){ return m_key; }   // access for printing/consumers
@@ -236,20 +237,24 @@ void QkdFiberChannel::Attach (Ptr<NetDevice> dev, double lambdaNm)
 
 void QkdFiberChannel::UpdateClassicalLoad (double lambdaNm, double mbps)
 {
-  for (auto &p : m_ports)
-    if (std::abs (p.lambdaNm - lambdaNm) < 1e-6) { p.mbps = mbps; break; }
+  bool matched = false;
+  for (auto &p : m_ports) {
+    if (std::abs (p.lambdaNm - lambdaNm) < 1e-6) { p.mbps = mbps; matched = true; break; }
+  }
+  if (!matched) { m_sidebandLoads[lambdaNm] = mbps; }
 }
 
 // Gaussian-weighted Raman/crosstalk from other λ, scaled by their Mbps
 double QkdFiberChannel::ExtraDepol (double lambdaNm) const
 {
   double extra = 0.0;
-  for (const auto &p : m_ports)
-    {
-      if (p.mbps <= 0.0 || p.lambdaNm == lambdaNm) continue;
-      const double d = std::abs (p.lambdaNm - lambdaNm);
-      extra += (p.mbps / 1e3) * m_k * std::exp (- (d*d) / (2 * m_sigmaNm * m_sigmaNm));
-    }
+  auto add = [&](double lam, double mbps){
+    if (mbps <= 0.0 || lam == lambdaNm) return;
+    const double d = std::abs(lam - lambdaNm);
+    extra += (mbps / 1e3) * m_k * std::exp(-(d*d) / (2 * m_sigmaNm * m_sigmaNm));
+  };
+  for (const auto &p : m_ports) add(p.lambdaNm, p.mbps);
+  for (const auto &kv : m_sidebandLoads) add(kv.first, kv.second);
   return extra;
 }
 
@@ -333,6 +338,8 @@ int64_t QkdNetDevice::AssignStreams (int64_t stream) {
 void QkdNetDevice::SendBatch (uint32_t nPulses)
 {
   if (!m_ch) { std::cout << "QkdNetDevice: no channel" << std::endl; return; }
+
+  std::cout << "DEBUG: SendBatch(" << nPulses << ") at t=" << Simulator::Now().GetSeconds() << "s" << std::endl;
 
   // 1) Channel propagation → loss + depolarization probability (aggregated)
   auto out = m_ch->Propagate (nPulses, m_lambdaNm, m_baseDepol);
@@ -698,6 +705,7 @@ public:
   void Kickoff(uint32_t winId){
     if (!m_tx) return;
     auto w = m_tx->LastWindow();
+    std::cout << "DEBUG: SIFT Kickoff winId=" << winId << " nXX=" << w.nXX << " nZZ=" << w.nZZ << std::endl;
     QkdProtoMsg m{winId,w.nXX,w.nZZ,w.errX,w.errZ,w.qberX,m_sid.src,m_sid.dst,"SIFT"};
     m_sendAt = Simulator::Now(); m_waiting=winId;
     std::string s = QkdProtoSerialize(m);
@@ -707,24 +715,32 @@ public:
 
   // expose classical stats (optional for ML)
   struct CStats { double rttMs=0; uint32_t timeouts=0; } cstats;
+  bool Busy() const { return m_waiting != 0; }
 
 private:
   void OnRecv(Ptr<Socket> s){
     Address from; Ptr<Packet> p = s->RecvFrom(from);
     std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
     QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="ACK" || m.winId!=m_waiting) return;
+    std::cout << "DEBUG: SIFT ACK received winId=" << m.winId << ", calling CloseWindow" << std::endl;
     cstats.rttMs = (Simulator::Now() - m_sendAt).GetMilliSeconds();
     if (m_sm) m_sm->CloseWindow(m_sid);   // commit bits now
     m_waiting = 0;
+    m_retries = 0;
   }
   void OnTimeout(uint32_t wid){
     if (wid!=m_waiting) return;
     cstats.timeouts++; m_waiting=0;
-    // no CloseWindow() → models classical failure ⇒ 0 bits for this window
+    // one simple retry
+    if (m_retries < 1) {
+      ++m_retries;
+      Simulator::Schedule(MilliSeconds(5), &QkdSiftingApp::Kickoff, this, wid);
+    }
   }
   Ptr<Node> m_me; Ptr<Socket> m_sock; Ipv4Address m_peer; uint16_t m_dport{9753}; uint8_t m_dscp{0xC0};
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
   Time m_to{MilliSeconds(50)}; Time m_sendAt; uint32_t m_waiting{0};
+  uint32_t m_retries{0};
 };
 
 // QKD: per-session orchestrator (quantum batches + window close + ML) ----------
@@ -741,6 +757,7 @@ public:
   }
   void BindSiftingApp(Ptr<QkdSiftingApp> siftApp) { m_siftApp = siftApp; }
   void StartApplication() override {
+    std::cout << "DEBUG: QkdSessionLoop StartApplication() at t=" << Simulator::Now().GetSeconds() << "s, window=" << m_tw.GetSeconds() << "s" << std::endl;
     m_run=true;
     m_batchEvt = Simulator::ScheduleNow(&QkdSessionLoop::DoBatch, this);
     m_winEvt   = Simulator::Schedule(m_tw, &QkdSessionLoop::CloseWindow, this);
@@ -758,16 +775,18 @@ private:
   }
   void CloseWindow(){
     if (!m_run) return;
+    std::cout << "DEBUG: CloseWindow() at t=" << Simulator::Now().GetSeconds() << "s" << std::endl;
     // 1) snapshot quantum stats
     m_tx->EndWindow();
 
-    // 2) send SIFT and wait for ACK before committing (if sifting app available)
-    if (m_siftApp) {
-      m_siftApp->Kickoff(++m_winId);    // send SIFT; sessions.CloseWindow(sAB) runs on ACK
-      // (do NOT call m_sm->CloseWindow here anymore)
+    // 2) Kick off classical sifting for this window; commit happens on ACK
+    ++m_winId;
+    if (m_siftApp && !m_siftApp->Busy()) {
+      m_siftApp->Kickoff(m_winId);
     } else {
-      // fallback: immediate commit (for backward compatibility)
-      if (m_sm) m_sm->CloseWindow(m_sid);
+      // If previous window still in flight, try again shortly (don't lose this window)
+      Simulator::Schedule(MilliSeconds(10), &QkdSessionLoop::CloseWindow, this);
+      return;
     }
 
     // 3) optional ML step: maximize SKR (apply to *next* window)
@@ -821,6 +840,7 @@ private:
     Address from; Ptr<Packet> p = s->RecvFrom(from);
     std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
     QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="SIFT") return;
+    std::cout << "DEBUG: Responder received SIFT winId=" << m.winId << ", sending ACK" << std::endl;
     // Respond with ACK containing the same window ID
     QkdProtoMsg ack{m.winId,0,0,0,0,0,m.dst,m.src,"ACK"};
     std::string ackMsg = QkdProtoSerialize(ack);
@@ -1703,19 +1723,22 @@ protected:
     
     // Simplified: Skip meters for now due to syntax issues, focus on DSCP classification
     // This still provides traffic class separation and priority handling
-    NS_LOG_INFO("Installing DSCP-based QoS classification (meters disabled for compatibility)");
+    NS_LOG_INFO("Installing basic classification (DSCP matching disabled for compatibility)");
     
-    // Table 0: QoS Classification without Metering (for compatibility)
+    // Table 0: Basic Classification (DSCP matching temporarily disabled)
+    // TODO: Fix OpenFlow DSCP syntax compatibility
+    /*
     for (const auto& tc : classes) {
       std::ostringstream flowCmd;
       flowCmd << "flow-mod cmd=add,table=0,prio=" << tc.priority
-              << " eth_type=0x0800,ip_dscp=" << (tc.dscp >> 2); // Convert to 6-bit DSCP field
+              << " eth_type=0x0800 nw_tos=" << (tc.dscp << 2); // Convert DSCP to TOS field
       
       // Forward to routing table (no metering for now)
       flowCmd << " goto:1";
       std::string qosTag = "QoS-" + tc.name;
       DpctlOrWarn(qosTag.c_str(), dpid, flowCmd.str());
     }
+    */
     
     // Default classification for unmarked traffic -> best effort
     DpctlOrWarn("QoS-Default", dpid, 
@@ -2997,7 +3020,7 @@ private:
     ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(siftA);
     siftA->Configure( usingCsv ? hostByIndex[qSrc] : man.host[qSrc],
                       ifs.GetAddress(qDst), /*port*/9753, /*DSCP*/0xC0,
-                      &sessions, sAB, MilliSeconds(50));
+                      &sessions, sAB, MilliSeconds(200));
     siftA->BindTx(alice);
     siftA->SetStartTime(Seconds(0.9));
     siftA->SetStopTime(Seconds(20.0));
@@ -3196,7 +3219,7 @@ private:
       
       // Get final statistics from session manager and devices
       const auto& v = sessions.View(sAB);
-      uint32_t finalKeyBits = alice->Key().Buffer();
+      uint32_t finalKeyBits = v.buf;          // Read committed bits from session manager
       double keyRate = finalKeyBits / simTime;  // bits per second
       
       std::cout << "Simulation duration: " << simTime << "s" << std::endl;
