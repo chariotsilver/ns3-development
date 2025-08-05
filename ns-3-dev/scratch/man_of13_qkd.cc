@@ -792,6 +792,9 @@ private:
     QkdProtoMsg m{};
     if (!QkdProtoParse(buf, m) || m.kind != "ACK") return;
 
+    // Housekeeping: count ACKs independently of validity checks (for stats/logs)
+    if (m.kind == "ACK") m_totalAcksSeen++;
+
     // Accept ACK if we still have the window pending (even if m_waiting was cleared)
     auto pw = m_pendingWindows.find(m.winId);
     if (pw == m_pendingWindows.end()) {
@@ -874,6 +877,9 @@ private:
   // NEW: per-window quantum stats + send timestamps
   std::map<uint32_t, qkd::QkdStats> m_pendingWindows;
   std::map<uint32_t, Time> m_sentAt;
+  
+  // Housekeeping: track total ACKs seen (independent of validity checks)
+  uint32_t m_totalAcksSeen{0};
 };
 
 // QKD: per-session orchestrator (quantum batches + window close + ML) ----------
@@ -3560,11 +3566,13 @@ private:
     // QKD Performance Summary
     if (enableQkdTesting) {
       std::cout << "\n=== QKD Performance Summary (" << qkdTestMode << " mode) ===" << std::endl;
-      double simTime = (enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : 15.0));
       
       // Get final statistics from session manager and devices
       const auto& v = sessions.View(sAB);
       uint32_t finalKeyBits = v.buf;          // Read committed bits from session manager
+      
+      // Use actual simulation time from Simulator::Now() instead of hardcoded value
+      double simTime = Simulator::Now().GetSeconds();
       double keyRate = finalKeyBits / simTime;  // bits per second
       
       std::cout << "Simulation duration: " << simTime << "s" << std::endl;
