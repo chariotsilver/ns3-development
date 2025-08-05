@@ -632,6 +632,73 @@ private:
   qkd::MlBridge m_ml;                        // ML socket
   bool m_mlConnected = false;
 };
+
+// QKD: per-session orchestrator (quantum batches + window close + ML) ----------
+class QkdSessionLoop : public Application {
+public:
+  void Configure(qkd::SessionManager* sm, qkd::SessionId sid,
+                 Ptr<qkd::QkdNetDevice> tx, Ptr<qkd::QkdNetDevice> rx,
+                 Time batchPeriod, uint32_t pulsesPerBatch,
+                 Time windowPeriod, bool dynamicBias,
+                 qkd::MlBridge* ml) {
+    m_sm=sm; m_sid=sid; m_tx=tx; m_rx=rx;
+    m_tb=batchPeriod; m_np=pulsesPerBatch; m_tw=windowPeriod;
+    m_dyn=dynamicBias; m_ml=ml;
+  }
+  void StartApplication() override {
+    m_run=true;
+    m_batchEvt = Simulator::ScheduleNow(&QkdSessionLoop::DoBatch, this);
+    m_winEvt   = Simulator::Schedule(m_tw, &QkdSessionLoop::CloseWindow, this);
+  }
+  void StopApplication() override {
+    m_run=false;
+    if (m_batchEvt.IsRunning()) m_batchEvt.Cancel();
+    if (m_winEvt.IsRunning())   m_winEvt.Cancel();
+  }
+private:
+  void DoBatch(){
+    if (!m_run) return;
+    m_tx->SendBatch(m_np);
+    m_batchEvt = Simulator::Schedule(m_tb, &QkdSessionLoop::DoBatch, this);
+  }
+  void CloseWindow(){
+    if (!m_run) return;
+    // 1) snapshot quantum stats
+    m_tx->EndWindow();
+
+    // 2) (for now) commit immediately to SessionManager
+    if (m_sm) m_sm->CloseWindow(m_sid);
+
+    // 3) optional ML step: maximize SKR (apply to *next* window)
+    if (m_dyn && m_ml){
+      const auto& v = m_sm->View(m_sid);
+      auto [pZtx, pZrx] = m_tx->GetBiases();
+
+      qkd::Obs ob{};
+      ob.src = m_sid.src; ob.dst = m_sid.dst;
+      ob.nXX = v.nXX; ob.nZZ = v.nZZ; ob.qberX = v.qberX;
+      ob.keyBuf = v.buf; ob.pZtx = pZtx;
+      ob.lastBits = v.lastBits; ob.winSec = m_tw.GetSeconds();
+
+      m_ml->SendObs(ob);
+      qkd::Act act;
+      if (m_ml->TryRecvAct(act) && act.hasPz){
+        m_tx->SetTxBasisBias(act.pZ);   // takes effect next window
+      }
+    }
+
+    ++m_winId;
+    m_winEvt = Simulator::Schedule(m_tw, &QkdSessionLoop::CloseWindow, this);
+  }
+
+  // wiring
+  qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{};
+  Ptr<qkd::QkdNetDevice> m_tx, m_rx;
+  Time m_tb=MilliSeconds(10), m_tw=MilliSeconds(100);
+  uint32_t m_np=5000, m_winId=0; bool m_dyn=true;
+  qkd::MlBridge* m_ml=nullptr;
+  EventId m_batchEvt, m_winEvt; bool m_run=false;
+};
 } // namespace ns3
 
 // Link Failure and Recovery Module for Network Robustness Testing
