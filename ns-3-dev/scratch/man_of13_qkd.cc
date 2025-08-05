@@ -448,6 +448,29 @@ public:
     e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.qberX = w.qberX;
     m_lastCommitted[s] = wid;
   }
+  void CloseWindowWithStats(SessionId s, uint32_t wid, const QkdStats& w){
+    auto it = m_map.find(s);
+    if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
+    if (m_lastCommitted[s] == wid) return; // idempotent per-window
+    auto& e = it->second;
+    e.km.Update(w.nXX, w.nZZ, w.qberX);
+    e.view.buf = e.km.Buffer();
+    e.view.lastBits = e.km.LastWindowBits();
+    e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.qberX = w.qberX;
+    m_lastCommitted[s] = wid;
+  }
+  void StorePendingWindow(SessionId s, uint32_t wid, const QkdStats& stats) {
+    m_pendingWindows[s][wid] = stats;
+  }
+  bool GetPendingWindowStats(SessionId s, uint32_t wid, QkdStats& stats) {
+    auto sessionIt = m_pendingWindows.find(s);
+    if (sessionIt == m_pendingWindows.end()) return false;
+    auto windowIt = sessionIt->second.find(wid);
+    if (windowIt == sessionIt->second.end()) return false;
+    stats = windowIt->second;
+    sessionIt->second.erase(windowIt);  // Remove processed window
+    return true;
+  }
   uint32_t Drain(SessionId s, uint32_t n){ 
     return m_map[s].km.Drain(n); 
   }
@@ -462,6 +485,7 @@ private:
   };
   std::map<SessionId, Entry> m_map;
   std::map<SessionId, uint32_t> m_lastCommitted;  // track per-session last committed wid
+  std::map<SessionId, std::map<uint32_t, QkdStats>> m_pendingWindows;  // pending window stats
 };
 
 }} // ns3::qkd
@@ -703,6 +727,9 @@ bool QkdProtoParse(const std::string& s, QkdProtoMsg& m) {
   return !m.kind.empty();
 }
 
+// Forward declaration
+class QkdSessionLoop;
+
 // QKD: Sifting Application (Alice's SIFT sender with ACK/timeout handling) ----
 class QkdSiftingApp : public Application {
 public:
@@ -711,6 +738,15 @@ public:
     m_me=me; m_peer=peer; m_dport=dport; m_dscp=dscp; m_sm=sm; m_sid=sid; m_to=timeout;
   }
   void BindTx(Ptr<qkd::QkdNetDevice> tx){ m_tx=tx; }
+  void BindSessionLoop(Ptr<QkdSessionLoop> sessionLoop){ m_sessionLoop=sessionLoop; }
+  void SetMlBridge(qkd::MlBridge* ml) { m_ml = ml; }
+  void SetWindowPeriod(Time tw) { m_winPeriod = tw; }
+  
+  // NEW: called by the session loop when a window closes
+  void RegisterAndSiftWindow(uint32_t winId, const qkd::QkdStats& stats) {
+    m_pendingWindows[winId] = stats;
+    if (!Busy()) Kickoff(winId);
+  }
   void StartApplication() override {
     m_sock = Socket::CreateSocket(m_me, UdpSocketFactory::GetTypeId());
     m_sock->SetIpTos(m_dscp);
@@ -723,10 +759,15 @@ public:
 
   void Kickoff(uint32_t winId){
     if (!m_tx) return;
-    auto w = m_tx->LastWindow();
+    // Use the exact stats for this window (no reliance on "last window")
+    auto it = m_pendingWindows.find(winId);
+    qkd::QkdStats w{};
+    if (it != m_pendingWindows.end()) w = it->second;
+    
     std::cout << "DEBUG: SIFT Kickoff winId=" << winId << " nXX=" << w.nXX << " nZZ=" << w.nZZ << std::endl;
     QkdProtoMsg m{winId,w.nXX,w.nZZ,w.errX,w.errZ,w.qberX,m_sid.src,m_sid.dst,"SIFT"};
     m_sendAt = Simulator::Now(); m_waiting=winId;
+    m_sentAt[winId] = m_sendAt;
     std::string s = QkdProtoSerialize(m);
     m_sock->SendTo(Create<Packet>((uint8_t*)s.c_str(), s.size()), 0, InetSocketAddress(m_peer, m_dport));
     Simulator::Schedule(m_to, &QkdSiftingApp::OnTimeout, this, winId);
@@ -741,26 +782,81 @@ private:
     Address from; Ptr<Packet> p = s->RecvFrom(from);
     std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
     QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="ACK" || m.winId!=m_waiting) return;
-    std::cout << "DEBUG: SIFT ACK received winId=" << m.winId << ", updating RTT telemetry" << std::endl;
-    cstats.rttMs = (Simulator::Now() - m_sendAt).GetMilliSeconds();
-    // Dedupe by wid: commit was already done optimistically on window close
-    if (m_sm) m_sm->CloseWindow(m_sid, m.winId);  // wid-aware, idempotent
-    m_waiting = 0;
-    m_retries = 0;
+    
+    std::cout << "DEBUG: SIFT ACK received winId=" << m.winId << " (finalizing window)" << std::endl;
+    
+    // Fresh classical RTT for THIS window
+    auto sentIt = m_sentAt.find(m.winId);
+    Time sent = (sentIt!=m_sentAt.end()? sentIt->second : m_sendAt);
+    cstats.rttMs = (Simulator::Now() - sent).GetMilliSeconds();
+
+    // FIX #1: Commit keys ONLY now, using the exact quantum stats for this window
+    auto pw = m_pendingWindows.find(m.winId);
+    if (pw != m_pendingWindows.end() && m_sm){
+      m_sm->CloseWindowWithStats(m_sid, m.winId, pw->second);
+    }
+
+    // FIX #2: Send synchronized ML observation (fresh quantum + fresh classical)
+    if (m_ml){
+      qkd::Obs ob{};
+      ob.src = m_sid.src; ob.dst = m_sid.dst;
+      if (pw != m_pendingWindows.end()){
+        ob.nXX = pw->second.nXX; ob.nZZ = pw->second.nZZ; ob.qberX = pw->second.qberX;
+      }
+      const auto& v = m_sm->View(m_sid);
+      auto [pZtx, pZrx] = m_tx->GetBiases();
+      ob.keyBuf = v.buf; ob.lastBits = v.lastBits; ob.pZtx = pZtx;
+      ob.winSec = m_winPeriod.GetSeconds();
+      ob.siftRttMs = cstats.rttMs; ob.siftTimeouts = cstats.timeouts;
+      m_ml->SendObs(ob);
+
+      qkd::Act act;
+      if (m_ml->TryRecvAct(act) && act.hasPz){
+        m_tx->SetTxBasisBias(act.pZ);
+      }
+    }
+
+    // Housekeeping
+    m_waiting = 0; m_retries = 0;
+    if (pw != m_pendingWindows.end()) m_pendingWindows.erase(pw);
+    if (sentIt != m_sentAt.end()) m_sentAt.erase(sentIt);
+    
+    // Kick next pending (if any)
+    if (!m_pendingWindows.empty()){
+      auto nextId = m_pendingWindows.begin()->first;
+      Kickoff(nextId);
+    }
   }
   void OnTimeout(uint32_t wid){
     if (wid!=m_waiting) return;
     cstats.timeouts++; m_waiting=0;
-    // Enhanced retry with backoff
     if (m_retries < m_maxRetries) {
       ++m_retries;
       Simulator::Schedule(m_backoff * m_retries, &QkdSiftingApp::Kickoff, this, wid);
+    } else {
+      // Give up: drop this window's pending stats to prevent leaks
+      m_pendingWindows.erase(wid);
+      m_sentAt.erase(wid);
+      // Try the next pending window if any
+      if (!m_pendingWindows.empty()){
+        auto nextId = m_pendingWindows.begin()->first;
+        Kickoff(nextId);
+      }
     }
   }
   Ptr<Node> m_me; Ptr<Socket> m_sock; Ipv4Address m_peer; uint16_t m_dport{9753}; uint8_t m_dscp{0xC0};
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
+  Ptr<QkdSessionLoop> m_sessionLoop;  // reference to session loop for pending window stats
   Time m_to{MilliSeconds(50)}; Time m_sendAt; uint32_t m_waiting{0};
   uint32_t m_retries{0}; uint32_t m_maxRetries{3}; Time m_backoff{MilliSeconds(20)};
+  
+  // NEW: ML + window period for synchronized obs
+  qkd::MlBridge* m_ml = nullptr;
+  Time m_winPeriod{Seconds(0)};
+  
+  // NEW: per-window quantum stats + send timestamps
+  std::map<uint32_t, qkd::QkdStats> m_pendingWindows;
+  std::map<uint32_t, Time> m_sentAt;
 };
 
 // QKD: per-session orchestrator (quantum batches + window close + ML) ----------
@@ -787,6 +883,7 @@ public:
     if (m_batchEvt.IsRunning()) m_batchEvt.Cancel();
     if (m_winEvt.IsRunning())   m_winEvt.Cancel();
   }
+  
 private:
   void DoBatch(){
     if (!m_run) return;
@@ -795,46 +892,20 @@ private:
   }
   void CloseWindow(){
     if (!m_run) return;
-    std::cout << "DEBUG: CloseWindow() at t=" << Simulator::Now().GetSeconds() << "s" << std::endl;
-    // 1) snapshot quantum stats
+    
+    // 1) Finish the quantum window and snapshot its stats
     m_tx->EndWindow();
+    const qkd::QkdStats& stats = m_tx->LastWindow();
+
+    // 2) Bump window id
     ++m_winId;
 
-    // 2) Optimistic commit immediately (commit-on-close with dedupe)
-    if (m_sm) m_sm->CloseWindow(m_sid, m_winId);   // commit immediately, idempotent by wid
-
-    // 3) Kick off classical sifting for this window; ACK will update RTT/timeout telemetry only
-    if (m_siftApp && !m_siftApp->Busy()) {
-      m_siftApp->Kickoff(m_winId);
-    } else {
-      // If previous window still in flight, try again shortly (don't lose this window)
-      Simulator::Schedule(MilliSeconds(10), &QkdSessionLoop::CloseWindow, this);
-      return;
+    // 3) Hand off to the sifting app; it will finalize on ACK and notify ML
+    if (m_siftApp) {
+      m_siftApp->RegisterAndSiftWindow(m_winId, stats);
     }
 
-    // 3) optional ML step: maximize SKR (apply to *next* window)
-    if (m_dyn && m_ml){
-      const auto& v = m_sm->View(m_sid);
-      auto [pZtx, pZrx] = m_tx->GetBiases();
-
-      qkd::Obs ob{};
-      ob.src = m_sid.src; ob.dst = m_sid.dst;
-      ob.nXX = v.nXX; ob.nZZ = v.nZZ; ob.qberX = v.qberX;
-      ob.keyBuf = v.buf; ob.pZtx = pZtx;
-      ob.lastBits = v.lastBits; ob.winSec = m_tw.GetSeconds();
-      // Add classical stats if sifting app is available
-      if (m_siftApp) {
-        ob.siftRttMs = m_siftApp->cstats.rttMs;
-        ob.siftTimeouts = m_siftApp->cstats.timeouts;
-      }
-
-      m_ml->SendObs(ob);
-      qkd::Act act;
-      if (m_ml->TryRecvAct(act) && act.hasPz){
-        m_tx->SetTxBasisBias(act.pZ);   // takes effect next window
-      }
-    }
-
+    // 4) Schedule next window close
     m_winEvt = Simulator::Schedule(m_tw, &QkdSessionLoop::CloseWindow, this);
   }
 
@@ -3187,11 +3258,19 @@ private:
                       ifs.GetAddress(qDst), /*port*/9753, /*DSCP*/0xC0,
                       &sessions, sAB, MilliSeconds(200));
     siftA->BindTx(alice);
+    
+    // Configure ML bridge and window period for synchronized observations
+    if (enableMlBridge && mlOK) {
+      siftA->SetMlBridge(&ml);
+    }
+    siftA->SetWindowPeriod(Seconds(qkdWindowSec));
+    
     siftA->SetStartTime(Seconds(0.9));
     siftA->SetStopTime(Seconds(simEnd - 0.1));
     
     // Bind sifting app to session loop for window commit coordination
     loop->BindSiftingApp(siftA);
+    siftA->BindSessionLoop(loop);
     
     // Create and install classical load monitoring application
     Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
