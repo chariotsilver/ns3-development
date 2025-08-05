@@ -781,46 +781,56 @@ private:
   void OnRecv(Ptr<Socket> s){
     Address from; Ptr<Packet> p = s->RecvFrom(from);
     std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
-    QkdProtoMsg m; if (!QkdProtoParse(buf,m) || m.kind!="ACK" || m.winId!=m_waiting) return;
-    
+
+    QkdProtoMsg m{};
+    if (!QkdProtoParse(buf, m) || m.kind != "ACK") return;
+
+    // Accept ACK if we still have the window pending (even if m_waiting was cleared)
+    auto pw = m_pendingWindows.find(m.winId);
+    if (pw == m_pendingWindows.end()) {
+      // Unknown or already processed window — ignore safely
+      return;
+    }
+
     std::cout << "DEBUG: SIFT ACK received winId=" << m.winId << " (finalizing window)" << std::endl;
-    
+
     // Fresh classical RTT for THIS window
     auto sentIt = m_sentAt.find(m.winId);
-    Time sent = (sentIt!=m_sentAt.end()? sentIt->second : m_sendAt);
+    Time sent = (sentIt != m_sentAt.end() ? sentIt->second : m_sendAt);
     cstats.rttMs = (Simulator::Now() - sent).GetMilliSeconds();
 
-    // FIX #1: Commit keys ONLY now, using the exact quantum stats for this window
-    auto pw = m_pendingWindows.find(m.winId);
-    if (pw != m_pendingWindows.end() && m_sm){
+    // Commit keys ONLY now, using the exact quantum stats for this window
+    if (m_sm){
       m_sm->CloseWindowWithStats(m_sid, m.winId, pw->second);
     }
 
-    // FIX #2: Send synchronized ML observation (fresh quantum + fresh classical)
+    // Build and send synchronized ML observation
     if (m_ml){
       qkd::Obs ob{};
       ob.src = m_sid.src; ob.dst = m_sid.dst;
-      if (pw != m_pendingWindows.end()){
-        ob.nXX = pw->second.nXX; ob.nZZ = pw->second.nZZ; ob.qberX = pw->second.qberX;
-      }
+      ob.nXX = pw->second.nXX; ob.nZZ = pw->second.nZZ; ob.qberX = pw->second.qberX;
+
       const auto& v = m_sm->View(m_sid);
       auto [pZtx, pZrx] = m_tx->GetBiases();
       ob.keyBuf = v.buf; ob.lastBits = v.lastBits; ob.pZtx = pZtx;
       ob.winSec = m_winPeriod.GetSeconds();
-      ob.siftRttMs = cstats.rttMs; ob.siftTimeouts = cstats.timeouts;
+      ob.siftRttMs = cstats.rttMs;
+      ob.siftTimeouts = cstats.timeouts;
+
       m_ml->SendObs(ob);
 
-      qkd::Act act;
-      if (m_ml->TryRecvAct(act) && act.hasPz){
+      qkd::Act act{};
+      if (m_ml->TryRecvAct(act) && act.hasPz) {
         m_tx->SetTxBasisBias(act.pZ);
       }
     }
 
     // Housekeeping
-    m_waiting = 0; m_retries = 0;
-    if (pw != m_pendingWindows.end()) m_pendingWindows.erase(pw);
+    if (m.winId == m_waiting) { m_waiting = 0; }
+    m_retries = 0;
+    m_pendingWindows.erase(pw);
     if (sentIt != m_sentAt.end()) m_sentAt.erase(sentIt);
-    
+
     // Kick next pending (if any)
     if (!m_pendingWindows.empty()){
       auto nextId = m_pendingWindows.begin()->first;
