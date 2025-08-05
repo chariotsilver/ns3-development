@@ -47,11 +47,13 @@ public:
   void UpdateClassicalLoad(double lambdaNm, double mbps);     // feed classical Mbps
   struct BatchOutcome { uint32_t nTx, nLost, nDepol; };
   BatchOutcome Propagate(uint32_t nPulses, double lambdaNm, double baseDepol); // batch sim
+  int64_t AssignStreams(int64_t stream);                      // tie RNG to ns-3 streams
   // Channel plumbing:
   std::size_t GetNDevices() const override; Ptr<NetDevice> GetDevice(std::size_t i) const override;
 private:
   struct Port { Ptr<NetDevice> dev; double lambdaNm; double mbps=0.0; };
   std::vector<Port> m_ports;
+  std::mt19937 m_rng{0xBADC0DE};                              // reproducible RNG
   double m_lenKm=10.0, m_lossDb=4.0, m_depol0=1e-4, m_k=5e-4, m_sigmaNm=10.0;
   double ExtraDepol(double lambdaNm) const;                   // Gaussian vs |Δλ|
 };
@@ -251,24 +253,29 @@ double QkdFiberChannel::ExtraDepol (double lambdaNm) const
   return extra;
 }
 
+// Assign ns-3 stream for reproducible RNG
+int64_t QkdFiberChannel::AssignStreams(int64_t stream)
+{
+  std::seed_seq seq{ int(stream & 0xffffffff), int((stream>>32)&0xffffffff) };
+  m_rng.seed(seq);
+  return 1;
+}
+
 // Batch propagate N pulses at λ: sample loss + (baseDepol + intrinsic + crosstalk)
 QkdFiberChannel::BatchOutcome
 QkdFiberChannel::Propagate (uint32_t nPulses, double lambdaNm, double baseDepol)
 {
-  // quick dB→prob; feel free to swap for a length/atten coeff model later
   const double lossProb = 1.0 - std::pow (10.0, -m_lossDb / 10.0);
-  const double depolProb = std::min (1.0,
-    std::max (0.0, baseDepol + m_depol0 + ExtraDepol (lambdaNm)));
+  const double depolProb = std::min (1.0, std::max (0.0, baseDepol + m_depol0 + ExtraDepol (lambdaNm)));
 
-  Ptr<UniformRandomVariable> urv = CreateObject<UniformRandomVariable> ();
-  BatchOutcome o { nPulses, 0u, 0u };
+  std::binomial_distribution<uint32_t> Bloss(nPulses, std::clamp(lossProb, 0.0, 1.0));
+  uint32_t nLost = Bloss(m_rng);
+  uint32_t nArr  = nPulses - nLost;
 
-  for (uint32_t i = 0; i < nPulses; ++i)
-    {
-      if (urv->GetValue () < lossProb) { ++o.nLost; continue; }
-      if (urv->GetValue () < depolProb) { ++o.nDepol; }
-    }
-  return o;
+  std::binomial_distribution<uint32_t> Bdep(nArr, std::clamp(depolProb, 0.0, 1.0));
+  uint32_t nDep  = Bdep(m_rng);
+
+  return { nPulses, nLost, nDep };
 }
 
 }} // namespace ns3::qkd
@@ -538,8 +545,8 @@ public:
   }
   
   void SetPeriod(Time t) { m_T = t; }          // align with your window
-  void SetTargetX(double r) { m_rX = std::clamp(r, 0.05, 0.3); }
-  void SetGain(double k) { m_k = std::clamp(k, 0.01, 0.5); }
+  void SetTargetX(double r) { m_rX = std::clamp(r, 0.05, 0.3); }  // DEPRECATED: Legacy rX target (for ablations)
+  void SetGain(double k) { m_k = std::clamp(k, 0.01, 0.5); }      // DEPRECATED: Legacy servo gain (for ablations)
   
   // New ML Bridge and Dynamic Control API
   void EnableDynamicBias(bool on) { m_dynamicBias = on; }
@@ -589,11 +596,11 @@ private:
         if (!m_dynamicBias) {
           // static mode: do nothing
         } else if (haveAct && act.hasPz) {
-          p.tx->SetTxBasisBias(act.pZ);
-          std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst
-                    << " ML pZ applied: " << pZtx << "->" << act.pZ << std::endl;
+          p.tx->SetTxBasisBias(act.pZ);   // ML decides pZ
+          std::cout << "BiasController " << p.sid.src << "->" << p.sid.dst
+                    << " pZ: " << pZtx << " -> " << act.pZ << "\n";
         } else {
-          // no ML action this window → hold last pZ (no rX servo)
+          // ML enabled but no action this window → hold last pZ, do nothing
         }
         
         // TODO route hook: ProgramRoute(p.sid, /*path*/);
@@ -617,7 +624,7 @@ private:
   std::vector<Pair> m_pairs; 
   qkd::SessionManager* m_sm = nullptr;
   Time m_T = MilliSeconds(100); 
-  double m_rX = 0.10, m_k = 0.08; 
+  double m_rX = 0.10, m_k = 0.08;           // DEPRECATED: Legacy rX servo parameters (kept for ablations)
   EventId m_evt;
   
   // ML Bridge and Dynamic Control
@@ -2742,6 +2749,7 @@ private:
 
     // --- QKD Layer Setup (after classical link A<->B is built) ---
     Ptr<qkd::QkdFiberChannel> qch = CreateObject<qkd::QkdFiberChannel>();
+    qch->AssignStreams(42);   // keep your run/seed policy consistent
 
     Ptr<qkd::QkdNetDevice> alice = CreateObject<qkd::QkdNetDevice>();
     alice->SetNode(usingCsv ? hostByIndex[qSrc] : man.host[qSrc]); 
@@ -2773,17 +2781,19 @@ private:
     Ptr<QkdBiasController> biasCtrl = CreateObject<QkdBiasController>();
     biasCtrl->UseSessions(&sessions);
     biasCtrl->AddPair(sAB, alice, bob);
-    biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000));  // Align with window period
-    biasCtrl->SetTargetX(0.10);  // Target 10% X-basis detection rate
-    biasCtrl->SetGain(0.08);     // Servo gain for bias adjustment
+    biasCtrl->SetPeriod(MilliSeconds(qkdWindowSec * 1000)); // keep this (window cadence)
+
+    // REMOVED legacy rX servo parameters when ML is default:
+    // biasCtrl->SetTargetX(0.10);  // Legacy: Target 10% X-basis detection rate  
+    // biasCtrl->SetGain(0.08);     // Legacy: Servo gain for bias adjustment
     
-    // After creating 'ctrl'
-    biasCtrl->EnableDynamicBias(enableDynamicTuning);                 // set false for static pZ runs (simulation parameter)
+    // ML on/off decides behavior:
+    biasCtrl->EnableDynamicBias(enableDynamicTuning);
     
     // Optional ML socket (configurable via --mlHost and --mlPort)
     if (enableMlBridge) {
-        bool ok = biasCtrl->ConnectMl(mlHost, mlPort);
-        std::cout << "ML bridge " << (ok ? "connected" : "not connected (fallback)") << std::endl;
+        bool ok = biasCtrl->ConnectMl(mlHost, mlPort);      // use parsed flags
+        std::cout << "ML bridge " << (ok ? "connected" : "not connected (hold pZ)") << std::endl;
     } else {
         std::cout << "QKD Bias Controller: Internal control only (dynamic=" << enableDynamicTuning << ")" << std::endl;
     }
