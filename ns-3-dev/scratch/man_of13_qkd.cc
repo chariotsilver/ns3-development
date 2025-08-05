@@ -412,12 +412,12 @@ public:
     if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
     auto& e = it->second;
     const auto& w = e.tx->LastWindow();             // assume symmetric windows
-    e.km.Update(w.nXX, w.nZZ, e.tx->GetRollingStats().qberX);
+    e.km.Update(w.nXX, w.nZZ, w.qberX);
     e.view.buf = e.km.Buffer(); 
     e.view.lastBits = e.km.LastWindowBits();
     e.view.nXX = w.nXX; 
     e.view.nZZ = w.nZZ; 
-    e.view.qberX = e.tx->GetRollingStats().qberX;
+    e.view.qberX = w.qberX;
   }
   uint32_t Drain(SessionId s, uint32_t n){ 
     return m_map[s].km.Drain(n); 
