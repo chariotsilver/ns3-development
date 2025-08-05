@@ -2780,9 +2780,9 @@ private:
     // After creating 'ctrl'
     biasCtrl->EnableDynamicBias(enableDynamicTuning);                 // set false for static pZ runs (simulation parameter)
     
-    // Optional ML socket (run your Python on localhost:5557)
+    // Optional ML socket (configurable via --mlHost and --mlPort)
     if (enableMlBridge) {
-        bool ok = biasCtrl->ConnectMl("127.0.0.1", 5557);
+        bool ok = biasCtrl->ConnectMl(mlHost, mlPort);
         std::cout << "ML bridge " << (ok ? "connected" : "not connected (fallback)") << std::endl;
     } else {
         std::cout << "QKD Bias Controller: Internal control only (dynamic=" << enableDynamicTuning << ")" << std::endl;
