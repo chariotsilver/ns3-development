@@ -428,6 +428,9 @@ public:
   void Bind(SessionId s, Ptr<QkdNetDevice> tx, Ptr<QkdNetDevice> rx) { 
     auto& e=m_map[s]; e.tx=tx; e.rx=rx; 
   }
+  
+  // DEPRECATED: Legacy window commit methods - not used with ACK-finalization
+  // Use CloseWindowWithStats() instead for ACK-based window finalization
   void CloseWindow(SessionId s){
     auto it = m_map.find(s); 
     if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
@@ -440,6 +443,9 @@ public:
     e.view.nZZ = w.nZZ; 
     e.view.qberX = w.qberX;
   }
+  
+  // DEPRECATED: Legacy window commit method - not used with ACK-finalization
+  // Use CloseWindowWithStats() instead for ACK-based window finalization
   void CloseWindow(SessionId s, uint32_t wid){
     auto it = m_map.find(s);
     if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
@@ -453,6 +459,9 @@ public:
     e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.qberX = w.qberX;
     m_lastCommitted[s] = wid;
   }
+  
+  // CURRENT: ACK-finalization window commit with explicit stats
+  // This method is used with the ACK-based sifting protocol
   void CloseWindowWithStats(SessionId s, uint32_t wid, const QkdStats& w){
     auto it = m_map.find(s);
     if (it==m_map.end() || !it->second.tx || !it->second.rx) return;
@@ -463,18 +472,6 @@ public:
     e.view.lastBits = e.km.LastWindowBits();
     e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.qberX = w.qberX;
     m_lastCommitted[s] = wid;
-  }
-  void StorePendingWindow(SessionId s, uint32_t wid, const QkdStats& stats) {
-    m_pendingWindows[s][wid] = stats;
-  }
-  bool GetPendingWindowStats(SessionId s, uint32_t wid, QkdStats& stats) {
-    auto sessionIt = m_pendingWindows.find(s);
-    if (sessionIt == m_pendingWindows.end()) return false;
-    auto windowIt = sessionIt->second.find(wid);
-    if (windowIt == sessionIt->second.end()) return false;
-    stats = windowIt->second;
-    sessionIt->second.erase(windowIt);  // Remove processed window
-    return true;
   }
   uint32_t Drain(SessionId s, uint32_t n){ 
     return m_map[s].km.Drain(n); 
@@ -490,7 +487,6 @@ private:
   };
   std::map<SessionId, Entry> m_map;
   std::map<SessionId, uint32_t> m_lastCommitted;  // track per-session last committed wid
-  std::map<SessionId, std::map<uint32_t, QkdStats>> m_pendingWindows;  // pending window stats
 };
 
 }} // ns3::qkd
@@ -745,7 +741,6 @@ public:
     m_me=me; m_peer=peer; m_dport=dport; m_dscp=dscp; m_sm=sm; m_sid=sid; m_to=timeout;
   }
   void BindTx(Ptr<qkd::QkdNetDevice> tx){ m_tx=tx; }
-  void BindSessionLoop(Ptr<QkdSessionLoop> sessionLoop){ m_sessionLoop=sessionLoop; }
   void SetMlBridge(qkd::MlBridge* ml) { m_ml = ml; }
   void SetWindowPeriod(Time tw) { m_winPeriod = tw; }
   
@@ -866,7 +861,6 @@ private:
   }
   Ptr<Node> m_me; Ptr<Socket> m_sock; Ipv4Address m_peer; uint16_t m_dport{9753}; uint8_t m_dscp{0xC0};
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
-  Ptr<QkdSessionLoop> m_sessionLoop;  // reference to session loop for pending window stats
   Time m_to{MilliSeconds(50)}; Time m_sendAt; uint32_t m_waiting{0};
   uint32_t m_retries{0}; uint32_t m_maxRetries{3}; Time m_backoff{MilliSeconds(20)};
   
@@ -3383,7 +3377,6 @@ private:
     
     // Bind sifting app to session loop for window commit coordination
     loop->BindSiftingApp(siftA);
-    siftA->BindSessionLoop(loop);
     
     // Create and install classical load monitoring application
     Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
