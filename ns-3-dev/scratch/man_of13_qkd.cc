@@ -565,7 +565,6 @@ private:
       const auto& v = m_sm->View(p.sid);
       const double matched = double(v.nXX + v.nZZ);
       if (matched > 0) {
-        const double rX = double(v.nXX) / matched;
         
         // Build obs per pair and talk to ML
         qkd::Obs ob;
@@ -588,18 +587,13 @@ private:
         bool haveAct = m_mlConnected && m_ml.TryRecvAct(act);
 
         if (!m_dynamicBias) {
-          // static mode: keep whatever pZ is (or set once from a param)
+          // static mode: do nothing
         } else if (haveAct && act.hasPz) {
-          p.tx->SetTxBasisBias(act.pZ);                // apply ML's pZ
-          std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
-                    << " rX=" << rX << " ML pZ: " << pZtx << "->" << act.pZ << std::endl;
+          p.tx->SetTxBasisBias(act.pZ);
+          std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst
+                    << " ML pZ applied: " << pZtx << "->" << act.pZ << std::endl;
         } else {
-          // fallback: proportional servo to hold X ratio
-          double pZnew = std::clamp(pZtx - m_k * (m_rX - rX), 0.05, 0.95);
-          p.tx->SetTxBasisBias(pZnew);
-          std::cout << "BiasController: Session " << p.sid.src << "->" << p.sid.dst 
-                    << " rX=" << rX << " target=" << m_rX 
-                    << " pZ: " << pZtx << "->" << pZnew << std::endl;
+          // no ML action this window → hold last pZ (no rX servo)
         }
         
         // TODO route hook: ProgramRoute(p.sid, /*path*/);
