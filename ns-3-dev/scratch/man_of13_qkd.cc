@@ -1,6 +1,8 @@
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
+#include "ns3/ipv4-header.h"
+#include "ns3/point-to-point-module.h"
 #include "ns3/csma-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/internet-apps-module.h"
@@ -1682,6 +1684,7 @@ public:
   
   void SetQoSConfig(bool enabled) {
     m_qosEnabled = enabled;
+    m_enableEnhancedQoS = enabled;  // Also set the enhanced QoS flag
     m_routeTable = m_qosEnabled ? 1u : 0u;
   }
 
@@ -1820,13 +1823,26 @@ protected:
            << " apply:set_queue=0,output=" << outPort;
     DpctlOrWarn("IPv4-CS6", dpid, cs6Cmd.str());
 
-    // Install default IPv4 rule with low priority queue (Q2) in table 1  
+    // Install BE policing meter (80 Mbps limit)
+    uint32_t meterId = 5 + (outPort % 100); // Unique meter per port
+    std::ostringstream meterCmd;
+    meterCmd << "meter-mod cmd=add,meter=" << meterId << " kbps,rate=80000";
+    DpctlOrWarn("Meter-BE", dpid, meterCmd.str());
+
+    // Install default IPv4 rule with low priority queue (Q2) and meter in table 1  
     // This catches all non-CS6 traffic (BE and other DSCP values)
-    // NOTE: Meter temporarily disabled due to OFSwitch13 compatibility issues
     std::ostringstream ipCmd;
-    ipCmd << "flow-mod cmd=add,table=1,prio=100"
-          << " eth_type=0x0800,eth_dst=" << host.mac
-          << " apply:set_queue=2,output=" << outPort;
+    if (m_enableEnhancedQoS) {
+      // With meter policing for BE traffic
+      ipCmd << "flow-mod cmd=add,table=1,prio=100"
+            << " eth_type=0x0800,eth_dst=" << host.mac
+            << " meter:" << meterId << ",apply:set_queue=2,output=" << outPort;
+    } else {
+      // Fallback without meter (for compatibility)
+      ipCmd << "flow-mod cmd=add,table=1,prio=100"
+            << " eth_type=0x0800,eth_dst=" << host.mac
+            << " apply:set_queue=2,output=" << outPort;
+    }
     DpctlOrWarn("IPv4-BE", dpid, ipCmd.str());
   }
 
@@ -1854,24 +1870,45 @@ protected:
           NS_LOG_DEBUG("host " << host.ip << " single path via DPID " << dpid 
                        << " out port " << paths[0].nextHop);
         } else {
-          // Multiple paths: use priority-based failover instead of groups
+          // Multiple paths: use priority-based failover with QoS differentiation
           // Install flows in decreasing priority order (highest priority = primary path)
           for (size_t i = 0; i < paths.size(); ++i) {
-            uint32_t priority = 150 - i; // Primary=150, backup1=149, backup2=148...
+            uint32_t pathPrio = 150 - i; // Primary=150, backup1=149, backup2=148...
             
             // Install ARP rule for this path in table 1
             std::ostringstream arpCmd;
-            arpCmd << "flow-mod cmd=add,table=1,prio=" << priority
+            arpCmd << "flow-mod cmd=add,table=1,prio=" << pathPrio
                    << " eth_type=0x0806,arp_tpa=" << host.ip
                    << " apply:output=" << paths[i].nextHop;
             DpctlOrWarn("ARP-MP", dpid, arpCmd.str());
 
-            // Install IPv4 rule for this path in table 1
-            std::ostringstream ipCmd;
-            ipCmd << "flow-mod cmd=add,table=1,prio=" << priority
-                  << " eth_type=0x0800,eth_dst=" << host.mac
-                  << " apply:output=" << paths[i].nextHop;
-            DpctlOrWarn("IPv4-MP", dpid, ipCmd.str());
+            // Install CS6 (DSCP=48) IPv4 rule with high priority queue (Q0) for this path
+            std::ostringstream cs6Cmd;
+            cs6Cmd << "flow-mod cmd=add,table=1,prio=" << (pathPrio + 200) // CS6 gets higher priority
+                   << " eth_type=0x0800,ip_dscp=48,eth_dst=" << host.mac
+                   << " apply:set_queue=0,output=" << paths[i].nextHop;
+            DpctlOrWarn("IPv4-CS6-MP", dpid, cs6Cmd.str());
+
+            // Install BE policing meter for this path (80 Mbps limit)
+            uint32_t meterId = 5 + (paths[i].nextHop % 100) + (i * 10); // Unique meter per path
+            std::ostringstream meterCmd;
+            meterCmd << "meter-mod cmd=add,meter=" << meterId << " kbps,rate=80000";
+            DpctlOrWarn("Meter-BE-MP", dpid, meterCmd.str());
+
+            // Install BE (default) IPv4 rule with low priority queue (Q2) and meter for this path
+            std::ostringstream beCmd;
+            if (m_enableEnhancedQoS) {
+              // With meter policing for BE traffic
+              beCmd << "flow-mod cmd=add,table=1,prio=" << pathPrio
+                    << " eth_type=0x0800,eth_dst=" << host.mac
+                    << " meter:" << meterId << ",apply:set_queue=2,output=" << paths[i].nextHop;
+            } else {
+              // Fallback without meter (for compatibility)
+              beCmd << "flow-mod cmd=add,table=1,prio=" << pathPrio
+                    << " eth_type=0x0800,eth_dst=" << host.mac
+                    << " apply:set_queue=2,output=" << paths[i].nextHop;
+            }
+            DpctlOrWarn("IPv4-BE-MP", dpid, beCmd.str());
           }
           
           NS_LOG_INFO("MultiPath: sw=" << std::hex << dpid << " -> " << host.ip
@@ -2001,6 +2038,7 @@ protected:
   bool m_multiPathEnabled{true};
   uint32_t m_maxPaths{3};
   bool m_qosEnabled{true};
+  bool m_enableEnhancedQoS{true};  // Enable BE policing meters
   uint32_t m_routeTable{1};  // 1 with QoS, 0 without (for future use)
 
 private:
@@ -2185,6 +2223,31 @@ static void QdLenTagged(std::string tag, uint32_t oldVal, uint32_t newVal) {
 
 static void QdDropTagged(std::string tag, Ptr<const QueueDiscItem>) {
   std::cout << Simulator::Now().GetSeconds() << ",DROP," << tag << ",1\n";
+}
+
+// Switch-specific tracing callbacks for QoS verification
+static void OnSwitchDrop(std::string tag, Ptr<const QueueDiscItem> item) {
+  // Extract DSCP/TOS from packet to identify CS6 vs BE drops
+  Ptr<const Packet> pkt = item->GetPacket();
+  if (pkt) {
+    Ptr<Packet> copy = pkt->Copy();
+    Ipv4Header ipHdr;
+    copy->RemoveHeader(ipHdr);
+    uint8_t tos = ipHdr.GetTos();
+    uint8_t dscp = tos >> 2;
+    std::string trafficType = (dscp == 48) ? "CS6" : "BE"; // CS6 = DSCP 48
+    std::cout << Simulator::Now().GetSeconds() << ",SW_DROP," << tag 
+              << ",type=" << trafficType << ",dscp=" << (int)dscp << "\n";
+  } else {
+    std::cout << Simulator::Now().GetSeconds() << ",SW_DROP," << tag << ",unknown\n";
+  }
+}
+
+static void OnSwitchQueueDepth(std::string tag, uint32_t oldVal, uint32_t newVal) {
+  // Only log significant queue depth changes to avoid spam
+  if (newVal > 10 || (newVal == 0 && oldVal > 0)) {
+    std::cout << Simulator::Now().GetSeconds() << ",SW_QLEN," << tag << "," << newVal << "\n";
+  }
 }
 
 static void PollQ(QueueDiscContainer qds, Time interval) {
@@ -2894,6 +2957,7 @@ private:
         swTch.SetRootQueueDisc("ns3::PfifoFastQueueDisc");
       }
       
+      QueueDiscContainer switchQdiscs;
       for (const auto& kv : swPorts) {
         const auto& plist = kv.second;
         for (uint32_t i = 0; i < plist.GetN(); ++i) {
@@ -2905,10 +2969,27 @@ private:
             tcl->DeleteRootQueueDiscOnDevice(dev);
           }
           
+          // Enhance TX queue limits on switch ports to avoid tiny NIC FIFO bottlenecks
+          if (Ptr<PointToPointNetDevice> p2pDev = DynamicCast<PointToPointNetDevice>(dev)) {
+            Ptr<DropTailQueue<Packet>> newQueue = CreateObject<DropTailQueue<Packet>>();
+            newQueue->SetMaxSize(QueueSize(std::to_string(txQueueMaxP) + "p"));
+            p2pDev->SetAttribute("TxQueue", PointerValue(newQueue));
+          }
+          
           // Install fresh PfifoFast on switch port
-          swTch.Install(NetDeviceContainer(dev));
+          QueueDiscContainer qdc = swTch.Install(NetDeviceContainer(dev));
+          switchQdiscs.Add(qdc.Get(0));
         }
       }
+      
+      // Attach tracing to switch qdiscs for verification (CS6 vs BE drop patterns)
+      for (uint32_t i = 0; i < switchQdiscs.GetN(); ++i) {
+        Ptr<QueueDisc> qd = switchQdiscs.Get(i);
+        std::string tag = "sw_port" + std::to_string(i);  // Simplified tagging
+        qd->TraceConnectWithoutContext("Drop", MakeBoundCallback(&OnSwitchDrop, tag));
+        qd->TraceConnectWithoutContext("PacketsInQueue", MakeBoundCallback(&OnSwitchQueueDepth, tag));
+      }
+      
       std::cout << "DEBUG: Installed PfifoFast on all switch ports for egress contention modeling" << std::endl;
     }
 
@@ -3124,11 +3205,13 @@ private:
           
           PacketSinkHelper extraSink("ns3::UdpSocketFactory", 
                                    InetSocketAddress(Ipv4Address::GetAny(), 9001 + k));
+          ApplicationContainer extraSinkApp;
           if (usingCsv) {
-            extraSink.Install(hostByIndex[dst]);
+            extraSinkApp = extraSink.Install(hostByIndex[dst]);
           } else {
-            extraSink.Install(man.host[dst]);
+            extraSinkApp = extraSink.Install(man.host[dst]);
           }
+          sinkApps.Add(extraSinkApp);  // <-- Include in BE RX totals
         }
         
       } else if (qkdTestMode == "attack") {
