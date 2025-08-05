@@ -1735,22 +1735,12 @@ protected:
     
     // Simplified: Skip meters for now due to syntax issues, focus on DSCP classification
     // This still provides traffic class separation and priority handling
-    NS_LOG_INFO("Installing basic classification (DSCP matching disabled for compatibility)");
+    NS_LOG_INFO("Installing basic classification for IP/ARP traffic");
     
-    // Table 0: Basic Classification (DSCP matching temporarily disabled)
-    // TODO: Fix OpenFlow DSCP syntax compatibility
-    /*
-    for (const auto& tc : classes) {
-      std::ostringstream flowCmd;
-      flowCmd << "flow-mod cmd=add,table=0,prio=" << tc.priority
-              << " eth_type=0x0800 nw_tos=" << (tc.dscp << 2); // Convert DSCP to TOS field
-      
-      // Forward to routing table (no metering for now)
-      flowCmd << " goto:1";
-      std::string qosTag = "QoS-" + tc.name;
-      DpctlOrWarn(qosTag.c_str(), dpid, flowCmd.str());
-    }
-    */
+    // Table 0: Basic Classification (DSCP matching disabled due to nw_tos syntax issues)
+    // CS6 classification disabled - relying on socket-level priority and PfifoFast queuing
+    // DpctlOrWarn("QoS-CS6", dpid, 
+    //             "flow-mod cmd=add,table=0,prio=230 eth_type=0x0800,nw_tos=0xC0 goto:1");
     
     // Default classification for unmarked traffic -> best effort
     DpctlOrWarn("QoS-Default", dpid, 
@@ -1760,9 +1750,9 @@ protected:
     DpctlOrWarn("QoS-ARP", dpid,
                 "flow-mod cmd=add,table=0,prio=250 eth_type=0x0806 goto:1");
     
-    // Table 0 miss -> drop (security: only IP and ARP allowed)
+    // Table 0 miss -> goto table 1 (pass-through for safety)
     DpctlOrWarn("QoS-Table0-Miss", dpid, 
-                "flow-mod cmd=add,table=0,prio=0 apply:");
+                "flow-mod cmd=add,table=0,prio=0 goto:1");
     
     // Table 1 miss -> drop (will be populated by routing logic)
     DpctlOrWarn("QoS-Table1-Miss", dpid, 
