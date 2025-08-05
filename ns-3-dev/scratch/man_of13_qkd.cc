@@ -2523,10 +2523,10 @@ private:
     std::string topoPath = "";
     bool enableRing = false;
     
-    // Queue parameters
-    uint32_t qdiscMaxP = 100, txQueueMaxP = 25;
+    // Queue parameters - optimized for load testing with switch egress queuing
+    uint32_t qdiscMaxP = 300, txQueueMaxP = 200;  // Recommended for load runs
     uint32_t qdiscPollMs = 20; // Higher default for scalability on larger topologies
-    bool qdiscOnSwitch = false; // Switch-egress contention modeling
+    bool qdiscOnSwitch = true; // Switch-egress contention modeling ENABLED for load testing
     
     // QoS parameters
     std::string qosMark = "CS6"; // or "EF"
