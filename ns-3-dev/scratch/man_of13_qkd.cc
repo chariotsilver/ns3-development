@@ -2778,6 +2778,11 @@ private:
     // Link failure parameters
     bool enableLinkFailures = false;  // Enable link failure simulation
     
+    // Random number generator for repeatable experiments
+    Ptr<UniformRandomVariable> classicalLoadRng = CreateObject<UniformRandomVariable>();
+    classicalLoadRng->SetAttribute("Min", DoubleValue(500.0));  // 500 Mbps minimum
+    classicalLoadRng->SetAttribute("Max", DoubleValue(2000.0)); // 2000 Mbps maximum
+    
     // Multi-path parameters
     bool enableMultiPath = true;      // Enable multi-path routing with fast failover
     uint32_t maxPaths = 3;            // Maximum number of paths to compute
@@ -3488,8 +3493,8 @@ private:
     // Periodic classical load updates (simulate varying traffic)
     EventId classicalEvt;
     std::function<void()> classicalFn = [&](){
-      // Simulate varying classical traffic (500-2000 Mbps)
-      double mbps = 500.0 + (std::rand() % 1500);  // Random load 500-2000 Mbps
+      // Simulate varying classical traffic using ns-3 RNG for repeatability
+      double mbps = classicalLoadRng->GetValue();  // Random load 500-2000 Mbps
       qch->UpdateClassicalLoad(1530.0, mbps);
       classicalEvt = Simulator::Schedule(Seconds(1.0), classicalFn);  // Update every second
     };
