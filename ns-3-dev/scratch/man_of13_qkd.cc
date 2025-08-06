@@ -2810,7 +2810,7 @@ private:
     cmd.AddValue("enableQkdTesting", "Enable comprehensive QKD performance testing", enableQkdTesting);
     cmd.AddValue("qkdPulseRate", "QKD pulse rate (pulses per 10ms window)", qkdPulseRate);
     cmd.AddValue("qkdWindowSec", "QKD key generation window duration (seconds)", qkdWindowSec);
-    cmd.AddValue("qkdTestMode", "QKD test mode: baseline|load|attack|distance", qkdTestMode);
+    cmd.AddValue("qkdTestMode", "QKD test mode: baseline|load|attack|distance. Note: 'baseline' and 'load' modes may override beRate and qkdPulseRate if not explicitly set by user", qkdTestMode);
     cmd.AddValue("qdiscMaxP", "PfifoFast per-band packet limit (packets). Applied only if supported in this ns-3 build.", qdiscMaxP);
     cmd.AddValue("txQueueMaxP", "CSMA device TX queue MaxSize (packets)", txQueueMaxP);
     cmd.AddValue("qdiscPollMs", "Queue poll period in milliseconds", qdiscPollMs);
@@ -3395,13 +3395,33 @@ private:
       if (qkdTestMode == "baseline") {
         // Baseline: minimal classical traffic, ideal conditions
         std::cout << "Baseline test: minimal classical interference" << std::endl;
-        beRate = "1Mbps";  // Reduce background traffic
-        qkdPulseRate = 100000;  // High pulse rate for max key generation
+        
+        // Apply test mode defaults only if not explicitly overridden by user
+        if (beRate == "10Mbps") {  // Default value, safe to override
+          beRate = "1Mbps";  // Reduce background traffic
+          std::cout << "  Setting beRate=1Mbps for baseline test" << std::endl;
+        } else {
+          std::cout << "  WARNING: beRate=" << beRate << " specified by user, keeping user value (baseline default would be 1Mbps)" << std::endl;
+        }
+        
+        if (qkdPulseRate == 80000) {  // Default value, safe to override
+          qkdPulseRate = 100000;  // High pulse rate for max key generation
+          std::cout << "  Setting qkdPulseRate=100000 for baseline test" << std::endl;
+        } else {
+          std::cout << "  WARNING: qkdPulseRate=" << qkdPulseRate << " specified by user, keeping user value (baseline default would be 100000)" << std::endl;
+        }
         
       } else if (qkdTestMode == "load") {
         // Load test: heavy classical traffic to test coexistence
         std::cout << "Load test: heavy classical traffic coexistence" << std::endl;
-        beRate = "100Mbps";  // High background traffic
+        
+        // Apply test mode defaults only if not explicitly overridden by user
+        if (beRate == "10Mbps") {  // Default value, safe to override
+          beRate = "100Mbps";  // High background traffic
+          std::cout << "  Setting beRate=100Mbps for load test" << std::endl;
+        } else {
+          std::cout << "  WARNING: beRate=" << beRate << " specified by user, keeping user value (load default would be 100Mbps)" << std::endl;
+        }
         
         // Add extra traffic between different host pairs
         for (uint32_t k = 0; k < numHosts/2; k++) {
