@@ -495,6 +495,7 @@ private:
 namespace ns3 { namespace qkd {
 struct Obs {
   uint32_t src, dst;      // node ids (session)
+  uint32_t winId;         // window ID for traceability with SIFT/ACK events
   uint32_t nXX, nZZ;      // matched counts in last window
   double   qberX;         // last-window QBER_X
   uint32_t keyBuf;        // buffered secret bits for this pair
@@ -537,7 +538,7 @@ public:
   bool SendObs(const Obs& o) {
     if (m_fd == -1) return false;
     json j = {
-      {"src", o.src}, {"dst", o.dst},
+      {"src", o.src}, {"dst", o.dst}, {"winId", o.winId},
       {"nXX", o.nXX}, {"nZZ", o.nZZ},
       {"qberX", o.qberX}, {"keyBuf", o.keyBuf},
       {"pZtx", o.pZtx}, {"lastBits", o.lastBits},
@@ -628,6 +629,7 @@ private:
         qkd::Obs ob;
         ob.src = p.sid.src; 
         ob.dst = p.sid.dst;
+        ob.winId = 0;  // Controller-based observation (no specific window)
         ob.nXX = v.nXX; 
         ob.nZZ = v.nZZ; 
         ob.qberX = v.qberX; 
@@ -813,6 +815,7 @@ private:
     if (m_ml){
       qkd::Obs ob{};
       ob.src = m_sid.src; ob.dst = m_sid.dst;
+      ob.winId = m.winId;  // Window ID for traceability
       ob.nXX = pw->second.nXX; ob.nZZ = pw->second.nZZ; ob.qberX = pw->second.qberX;
 
       const auto& v = m_sm->View(m_sid);
