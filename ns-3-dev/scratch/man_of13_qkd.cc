@@ -3514,6 +3514,13 @@ private:
       });
     }
 
+    // Schedule cleanup for classical load event to prevent infinite reschedule
+    Simulator::ScheduleDestroy([&classicalEvt]{
+      if (classicalEvt.IsRunning()) {
+        Simulator::Cancel(classicalEvt);
+      }
+    });
+
     Simulator::Stop(Seconds(enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : simEnd)));  // Extended time for testing scenarios
     Simulator::Run();
     
