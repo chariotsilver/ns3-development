@@ -696,38 +696,46 @@ struct QkdProtoMsg {
     : winId(wid), nXX(nxx), nZZ(nzz), errX(ex), errZ(ez), qberX(qx), src(s), dst(d), kind(k) {}
 };
 
-// Simple JSON-like serialization for QKD protocol messages
+// --- NEW: Robust JSON serialization using nlohmann/json ---
 std::string QkdProtoSerialize(const QkdProtoMsg& m) {
-  std::ostringstream oss;
-  oss << "{\"winId\":" << m.winId << ",\"nXX\":" << m.nXX << ",\"nZZ\":" << m.nZZ
-      << ",\"errX\":" << m.errX << ",\"errZ\":" << m.errZ << ",\"qberX\":" << m.qberX
-      << ",\"src\":" << m.src << ",\"dst\":" << m.dst << ",\"kind\":\"" << m.kind << "\"}";
-  return oss.str();
+    json j = {
+        {"winId", m.winId}, {"nXX", m.nXX}, {"nZZ", m.nZZ},
+        {"errX", m.errX}, {"errZ", m.errZ}, {"qberX", m.qberX},
+        {"src", m.src}, {"dst", m.dst}, {"kind", m.kind}
+    };
+    return j.dump();
 }
 
-// Simple JSON-like parsing for QKD protocol messages
+// --- NEW: Robust JSON parsing using nlohmann/json ---
 bool QkdProtoParse(const std::string& s, QkdProtoMsg& m) {
-  // Simple string parsing (not full JSON parser)
-  size_t pos = 0;
-  auto findNum = [&](const std::string& key) -> double {
-    size_t start = s.find("\"" + key + "\":", pos);
-    if (start == std::string::npos) return 0;
-    start = s.find(':', start) + 1;
-    size_t end = s.find_first_of(",}", start);
-    return std::stod(s.substr(start, end - start));
-  };
-  auto findStr = [&](const std::string& key) -> std::string {
-    size_t start = s.find("\"" + key + "\":\"", pos);
-    if (start == std::string::npos) return "";
-    start = s.find("\":\"", start) + 3;
-    size_t end = s.find('"', start);
-    return s.substr(start, end - start);
-  };
-  
-  m.winId = findNum("winId"); m.nXX = findNum("nXX"); m.nZZ = findNum("nZZ");
-  m.errX = findNum("errX"); m.errZ = findNum("errZ"); m.qberX = findNum("qberX");
-  m.src = findNum("src"); m.dst = findNum("dst"); m.kind = findStr("kind");
-  return !m.kind.empty();
+    try {
+        json j = json::parse(s);
+
+        // Use .at() for mandatory fields - it throws an exception if the key is missing.
+        m.winId = j.at("winId").get<uint32_t>();
+        m.kind = j.at("kind").get<std::string>();
+        m.src = j.at("src").get<uint32_t>();
+        m.dst = j.at("dst").get<uint32_t>();
+
+        // Handle QKD stats fields - check for optional fields with defaults for backward compatibility
+        m.nXX = j.contains("nXX") ? j.at("nXX").get<uint32_t>() : 0;
+        m.nZZ = j.contains("nZZ") ? j.at("nZZ").get<uint32_t>() : 0;
+        m.errX = j.contains("errX") ? j.at("errX").get<double>() : 0.0;
+        m.errZ = j.contains("errZ") ? j.at("errZ").get<double>() : 0.0;
+        m.qberX = j.contains("qberX") ? j.at("qberX").get<double>() : 0.0;
+        
+        return true; // Successfully parsed
+
+    } catch (const json::parse_error& e) {
+        std::cout << "QkdProtoParse: JSON parse error in message: " << s << " | Details: " << e.what() << std::endl;
+        return false;
+    } catch (const json::type_error& e) {
+        std::cout << "QkdProtoParse: JSON type error in message: " << s << " | Details: " << e.what() << std::endl;
+        return false;
+    } catch (const std::exception& e) {
+        std::cout << "QkdProtoParse: Generic error parsing message: " << s << " | Details: " << e.what() << std::endl;
+        return false;
+    }
 }
 
 // Forward declaration
@@ -750,17 +758,34 @@ public:
     if (!Busy()) Kickoff(winId);
   }
   void StartApplication() override {
+    m_running = true;
+    if (!m_me) {
+      std::cerr << "ERROR: QkdSiftingApp::StartApplication() called with null m_me node pointer!" << std::endl;
+      return;
+    }
     m_sock = Socket::CreateSocket(m_me, UdpSocketFactory::GetTypeId());
+    if (!m_sock) {
+      std::cerr << "ERROR: Failed to create socket in QkdSiftingApp::StartApplication()!" << std::endl;
+      return;
+    }
     m_sock->SetIpTos(m_dscp);
     m_sock->SetPriority(6);
     // Note: UDP sockets don't support TCP-specific buffer size attributes
     m_sock->Bind();
     m_sock->SetRecvCallback(MakeCallback(&QkdSiftingApp::OnRecv, this));
   }
-  void StopApplication() override { if (m_sock){ m_sock->Close(); m_sock=0; } }
+  void StopApplication() override { 
+    m_running = false;
+    if (m_sock){ m_sock->Close(); m_sock = nullptr; } 
+  }
 
   void Kickoff(uint32_t winId){
-    if (!m_tx) return;
+    if (!m_running) return; // Guard against race conditions
+    if (!m_tx || !m_sock) {
+      std::cerr << "ERROR: QkdSiftingApp::Kickoff() called with null pointers (m_tx=" << (m_tx ? "valid" : "null") 
+                << ", m_sock=" << (m_sock ? "valid" : "null") << ")" << std::endl;
+      return;
+    }
     // Use the exact stats for this window (no reliance on "last window")
     auto it = m_pendingWindows.find(winId);
     qkd::QkdStats w{};
@@ -781,6 +806,7 @@ public:
 
 private:
   void OnRecv(Ptr<Socket> s){
+    if (!m_running) return; // Guard against race conditions
     Address from; Ptr<Packet> p = s->RecvFrom(from);
     std::string buf(p->GetSize(), '\0'); p->CopyData((uint8_t*)buf.data(), buf.size());
 
@@ -844,6 +870,7 @@ private:
     }
   }
   void OnTimeout(uint32_t wid){
+    if (!m_running) return; // Guard against race conditions
     if (!m_waiting.has_value() || wid != m_waiting.value()) return;
     cstats.timeouts++; m_waiting.reset();
     if (m_retries < m_maxRetries) {
@@ -864,6 +891,7 @@ private:
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
   Time m_to{MilliSeconds(50)}; Time m_sendAt; std::optional<uint32_t> m_waiting;
   uint32_t m_retries{0}; uint32_t m_maxRetries{3}; Time m_backoff{MilliSeconds(20)};
+  bool m_running{false}; // Lifecycle flag to prevent race conditions
   
   // NEW: ML + window period for synchronized obs
   qkd::MlBridge* m_ml = nullptr;
