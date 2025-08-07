@@ -10,6 +10,8 @@
 #include "ns3/traffic-control-layer.h"
 #include "ns3/pfifo-fast-queue-disc.h"
 #include "ns3/queue-size.h"
+#include "ns3/drop-tail-queue.h"
+#include "ns3/error-model.h"
 #include <unordered_map>
 #include "ns3/ofswitch13-module.h"
 #include "ns3/flow-monitor-module.h"
