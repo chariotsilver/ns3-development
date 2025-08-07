@@ -997,15 +997,16 @@ public:
 
   void EnableFailures(bool enable) { m_enableFailures = enable; }
 
-  void RegisterLink(NetDeviceContainer link, const std::string& description = "") {
+  void RegisterLink(NetDeviceContainer link, const std::string& description = "", uint32_t queueSize = 100) {
     uint32_t linkId = m_linkIdCounter++;
     m_coreLinks[linkId] = link;
     m_linkDescriptions[linkId] = description.empty() 
       ? ("Link_" + std::to_string(linkId)) : description;
     m_linkStates[linkId] = true; // Initially operational
+    m_linkQueueSizes[linkId] = queueSize; // Store original queue size
     
     std::cout << "LinkFailureModule: Registered link " << linkId 
-              << " (" << m_linkDescriptions[linkId] << ")" << std::endl;
+              << " (" << m_linkDescriptions[linkId] << ") with queue size " << queueSize << "p" << std::endl;
   }
 
   void ScheduleRealisticFailures() {
@@ -1189,15 +1190,19 @@ private:
       return;
     }
 
+    // Get the original queue size for this link
+    uint32_t originalQueueSize = m_linkQueueSizes[linkId];
+    std::string queueSizeStr = std::to_string(originalQueueSize) + "p";
+
     // Re-enable transmission on both ends
     Ptr<CsmaNetDevice> dev0 = DynamicCast<CsmaNetDevice>(link.Get(0));
     Ptr<CsmaNetDevice> dev1 = DynamicCast<CsmaNetDevice>(link.Get(1));
 
     if (dev0) {
-      dev0->GetQueue()->SetMaxSize(QueueSize("100p")); // Restore default queue size
+      dev0->GetQueue()->SetMaxSize(QueueSize(queueSizeStr)); // Restore original queue size
     }
     if (dev1) {
-      dev1->GetQueue()->SetMaxSize(QueueSize("100p"));
+      dev1->GetQueue()->SetMaxSize(QueueSize(queueSizeStr));
     }
 
     // Remove any error models that might have been added
@@ -1209,7 +1214,8 @@ private:
     m_linkStates[linkId] = true;
 
     std::cout << "LinkFailureModule: RESTORED link " << linkId 
-              << " (" << m_linkDescriptions[linkId] << ") - " << reason << std::endl;
+              << " (" << m_linkDescriptions[linkId] << ") with queue size " 
+              << originalQueueSize << "p - " << reason << std::endl;
 
     // Notify controller about link restoration
     NotifyController(linkId, true);
@@ -1281,6 +1287,7 @@ private:
   std::unordered_map<uint32_t, NetDeviceContainer> m_coreLinks;
   std::unordered_map<uint32_t, std::string> m_linkDescriptions;
   std::unordered_map<uint32_t, bool> m_linkStates;
+  std::unordered_map<uint32_t, uint32_t> m_linkQueueSizes;  // Store original queue sizes
   std::vector<LinkFailureEvent> m_scheduledEvents;
   std::ofstream m_failureLog;
   uint32_t m_linkIdCounter;
@@ -2940,7 +2947,7 @@ private:
         std::string desc = usingCsv ? 
           ("CSV_Core_Link_" + std::to_string(i)) : 
           ("Line_Core_Link_" + std::to_string(i));
-        g_linkFailures.RegisterLink(coreLinks[i], desc);
+        g_linkFailures.RegisterLink(coreLinks[i], desc, txQueueMaxP);
       }
     }
 
