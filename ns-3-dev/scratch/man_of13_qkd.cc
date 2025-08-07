@@ -3614,7 +3614,8 @@ private:
       
       // Use actual simulation time from Simulator::Now() instead of hardcoded value
       double simTime = Simulator::Now().GetSeconds();
-      double keyRate = finalKeyBits / simTime;  // bits per second
+      // Safety check for division by zero (defensive programming)
+      double keyRate = (simTime > 1e-9) ? (finalKeyBits / simTime) : 0.0;  // bits per second
       
       std::cout << "Simulation duration: " << simTime << "s" << std::endl;
       std::cout << "Final key buffer: " << finalKeyBits << " bits" << std::endl;
