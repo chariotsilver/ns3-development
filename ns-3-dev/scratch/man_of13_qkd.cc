@@ -34,6 +34,7 @@
 #include <atomic>
 #include <random>      // std::mt19937, std::binomial_distribution
 #include <cmath>       // std::ceil, std::log2
+#include <optional>    // std::optional for modern C++ optional values
 #include <nlohmann/json.hpp>
 
 using namespace ns3;
@@ -767,7 +768,7 @@ public:
     
     std::cout << "DEBUG: SIFT Kickoff winId=" << winId << " nXX=" << w.nXX << " nZZ=" << w.nZZ << std::endl;
     QkdProtoMsg m{winId,w.nXX,w.nZZ,w.errX,w.errZ,w.qberX,m_sid.src,m_sid.dst,"SIFT"};
-    m_sendAt = Simulator::Now(); m_waiting=winId;
+    m_sendAt = Simulator::Now(); m_waiting = winId;
     m_sentAt[winId] = m_sendAt;
     std::string s = QkdProtoSerialize(m);
     m_sock->SendTo(Create<Packet>((uint8_t*)s.c_str(), s.size()), 0, InetSocketAddress(m_peer, m_dport));
@@ -776,7 +777,7 @@ public:
 
   // expose classical stats (optional for ML)
   struct CStats { double rttMs=0; uint32_t timeouts=0; } cstats;
-  bool Busy() const { return m_waiting != 0; }
+  bool Busy() const { return m_waiting.has_value(); }
 
 private:
   void OnRecv(Ptr<Socket> s){
@@ -831,7 +832,7 @@ private:
     }
 
     // Housekeeping
-    if (m.winId == m_waiting) { m_waiting = 0; }
+    if (m_waiting.has_value() && m.winId == m_waiting.value()) { m_waiting.reset(); }
     m_retries = 0;
     m_pendingWindows.erase(pw);
     if (sentIt != m_sentAt.end()) m_sentAt.erase(sentIt);
@@ -843,8 +844,8 @@ private:
     }
   }
   void OnTimeout(uint32_t wid){
-    if (wid!=m_waiting) return;
-    cstats.timeouts++; m_waiting=0;
+    if (!m_waiting.has_value() || wid != m_waiting.value()) return;
+    cstats.timeouts++; m_waiting.reset();
     if (m_retries < m_maxRetries) {
       ++m_retries;
       Simulator::Schedule(m_backoff * m_retries, &QkdSiftingApp::Kickoff, this, wid);
@@ -861,7 +862,7 @@ private:
   }
   Ptr<Node> m_me; Ptr<Socket> m_sock; Ipv4Address m_peer; uint16_t m_dport{9753}; uint8_t m_dscp{0xC0};
   qkd::SessionManager* m_sm=nullptr; qkd::SessionId m_sid{}; Ptr<qkd::QkdNetDevice> m_tx;
-  Time m_to{MilliSeconds(50)}; Time m_sendAt; uint32_t m_waiting{0};
+  Time m_to{MilliSeconds(50)}; Time m_sendAt; std::optional<uint32_t> m_waiting;
   uint32_t m_retries{0}; uint32_t m_maxRetries{3}; Time m_backoff{MilliSeconds(20)};
   
   // NEW: ML + window period for synchronized obs
@@ -1371,6 +1372,9 @@ public:
     m_qosDelaySum = 0.0;
     m_testStartTime = Time(0);
     m_qosStartTime = Time(0);
+    // Initialize test RNG for reproducible test behavior
+    m_testRng = CreateObject<UniformRandomVariable>();
+    m_testRng->SetStream(100);  // Use a distinct stream for test randomness
   }
 
   void RunComprehensiveTest(bool enableTests) {
@@ -1689,14 +1693,13 @@ private:
     // Track packets for QoS metrics (simplified tracking)
     if (dscp == "CS6") { // Track priority traffic
       Simulator::Schedule(Seconds(0.1), [this, packetsPerSecond]() {
-        Ptr<UniformRandomVariable> rand = CreateObject<UniformRandomVariable>();
         for (int i = 0; i < 50; ++i) { // 5 seconds * 50pps
-          Simulator::Schedule(MilliSeconds(i * 20), [this, rand]() {
+          Simulator::Schedule(MilliSeconds(i * 20), [this]() {
             m_qosSentPackets++;
-            // Simulate some loss and delay variation
-            if (rand->GetValue() > 0.001) { // 99.9% delivery
+            // Simulate some loss and delay variation using test RNG for reproducibility
+            if (m_testRng->GetValue() > 0.001) { // 99.9% delivery
               m_qosReceivedPackets++;
-              m_qosDelaySum += rand->GetValue(1.0, 10.0); // 1-10ms delay
+              m_qosDelaySum += m_testRng->GetValue(1.0, 10.0); // 1-10ms delay
             } else {
               m_qosLostPackets++;
             }
@@ -1741,6 +1744,9 @@ private:
   double m_qosDelaySum;
   Time m_testStartTime;
   Time m_qosStartTime;
+  
+  // Test-specific RNG for reproducible test behavior
+  Ptr<UniformRandomVariable> m_testRng;
 };
 
 // Global test framework instance
@@ -3327,6 +3333,9 @@ private:
     bob->SetLambda(1550.12);   
     bob->SetBasisBias(0.9);
     bob->AssignStreams(1);    // Assign stream 1 to Bob
+    
+    // Assign stream to classical load RNG for reproducibility
+    classicalLoadRng->SetStream(2);  // Assign stream 2 to classical load generator
 
     // --- Classical Load Monitoring Setup ---
     // Create classical load probe to monitor traffic and feed into QKD channel
