@@ -3570,7 +3570,11 @@ private:
       }
     });
 
-    Simulator::Stop(Seconds(enableSDNTesting ? 60.0 : (enableLinkFailures ? 120.0 : simEnd)));  // Extended time for testing scenarios
+    // Use the longest required duration to avoid cutting short any test scenarios
+    double finalStopTime = std::max({simEnd, 
+                                    enableSDNTesting ? 60.0 : 0.0, 
+                                    enableLinkFailures ? 120.0 : 0.0});
+    Simulator::Stop(Seconds(finalStopTime));
     Simulator::Run();
     
     // FlowMonitor telemetry output
