@@ -2874,6 +2874,18 @@ private:
     cmd.AddValue("mlPort", "ML bridge port number", mlPort);
     cmd.Parse(argc, argv);
 
+    // Calculate final simulation stop time for validation
+    const double simEnd = 20.5;  // Default QKD simulation duration
+    double finalStopTime = std::max({simEnd, 
+                                    enableSDNTesting ? 60.0 : 0.0, 
+                                    enableLinkFailures ? 120.0 : 0.0});
+    
+    // Validate QKD session timing
+    NS_ABORT_MSG_IF(qkdStart >= finalStopTime || (qkdStart + qkdDur) >= finalStopTime,
+                    "QKD session timing is outside the simulation run time. QKD session: " 
+                    << qkdStart << "s to " << (qkdStart + qkdDur) << "s, Simulation ends: " 
+                    << finalStopTime << "s");
+
     // Set deterministic seed
     RngSeedManager::SetSeed(seed);
     RngSeedManager::SetRun(run);
@@ -3393,7 +3405,6 @@ private:
                     /*dynamicBias*/ enableDynamicTuning,
                     /*ml*/ (mlOK ? &ml : nullptr));
     // Let the sim run past the last window/ACK
-    const double simEnd = 20.5;
     loop->SetStartTime(Seconds(1.0));
     loop->SetStopTime(Seconds(simEnd - 0.1));
     
@@ -3570,10 +3581,7 @@ private:
       }
     });
 
-    // Use the longest required duration to avoid cutting short any test scenarios
-    double finalStopTime = std::max({simEnd, 
-                                    enableSDNTesting ? 60.0 : 0.0, 
-                                    enableLinkFailures ? 120.0 : 0.0});
+    // Use the pre-calculated final stop time
     Simulator::Stop(Seconds(finalStopTime));
     Simulator::Run();
     
