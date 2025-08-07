@@ -744,7 +744,7 @@ public:
   void SetWindowPeriod(Time tw) { m_winPeriod = tw; }
   
   // NEW: called by the session loop when a window closes
-  void RegisterAndSiftWindow(uint32_t winId, const qkd::QkdStats& stats) {
+  void RegisterAndSiftWindow(uint32_t winId, qkd::QkdStats stats) {
     m_pendingWindows[winId] = stats;
     if (!Busy()) Kickoff(winId);
   }
