@@ -86,11 +86,6 @@ inline uint32_t EstimateSecretBits(uint32_t nZZ, double qberX, double ecEff=1.1)
 // QKD: Key buffer/manager
 class QkdKeyManager {
 public:
-  void Update(const QkdStats& s, uint32_t N){
-    if (PassesM1(s.nXX, N)) { m_lastBits = EstimateSecretBits(s.nZZ, s.qberX); m_ok=true; }
-    else { m_lastBits = 0; m_ok=false; }
-    m_buf += m_lastBits;
-  }
   void Update(uint32_t nXX, uint32_t nZZ, double qberX){
     uint32_t N = nXX + nZZ;
     if (PassesM1(nXX, N)) { m_lastBits = EstimateSecretBits(nZZ, qberX); m_ok = true; }
@@ -167,7 +162,7 @@ public:
 
 private:
   Ptr<QkdFiberChannel> m_ch; Ptr<Node> m_node; ReceiveCallback m_rx;
-  double m_lambdaNm=1550.12, m_pZ=0.9, m_baseDepol=0.0;
+  double m_lambdaNm=1550.12, m_baseDepol=0.0;
   QkdStats m_stats;
   QkdStats m_last;   // snapshot of the previous window's stats
   qkd::QkdKeyManager m_key;     // finite-key buffer
