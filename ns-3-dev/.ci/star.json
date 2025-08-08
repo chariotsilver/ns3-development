@@ -1,0 +1,40 @@
+{
+  "nodes": [
+    {"id": 0, "type": "switch"},
+    {"id": 1, "type": "host"},
+    {"id": 2, "type": "host"}
+  ],
+
+  "links": [
+    {
+      "id": 101,
+      "src": 0,
+      "dst": 1,
+      "kind": "spur",
+      "rate": "1Gbps",
+      "delay": "0.2ms"
+    },
+    {
+      "id": 102,
+      "src": 0,
+      "dst": 2,
+      "kind": "spur",
+      "rate": "1Gbps",
+      "delay": "0.2ms"
+    }
+  ],
+
+  "traffic_profiles": {
+    "best_effort": "10Mbps",
+    "qkd_control": {
+      "pps": 40,
+      "size": 200
+    }
+  },
+
+  "defaults": {
+    "ring": false,
+    "enableMultiPath": false,
+    "maxPaths": 2
+  }
+}

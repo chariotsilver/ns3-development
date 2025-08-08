@@ -1,0 +1,101 @@
+{
+  "nodes": [
+    {"id": 0, "type": "switch"},
+    {"id": 1, "type": "switch"},
+    {"id": 2, "type": "switch"},
+    {"id": 3, "type": "switch"},
+    {"id": 10, "type": "host"},
+    {"id": 11, "type": "host"},
+    {"id": 12, "type": "host"},
+    {"id": 13, "type": "host"}
+  ],
+
+  "links": [
+    {
+      "id": 201,
+      "src": 0,
+      "dst": 1,
+      "kind": "core",
+      "length_km": 5,
+      "loss_db": 2.5,
+      "rate": "10Gbps",
+      "delay": "0.5ms"
+    },
+    {
+      "id": 202,
+      "src": 1,
+      "dst": 2,
+      "kind": "core",
+      "length_km": 8,
+      "loss_db": 4.0,
+      "rate": "10Gbps",
+      "delay": "0.5ms"
+    },
+    {
+      "id": 203,
+      "src": 2,
+      "dst": 3,
+      "kind": "core",
+      "length_km": 6,
+      "loss_db": 3.0,
+      "rate": "10Gbps",
+      "delay": "0.5ms"
+    },
+    {
+      "id": 204,
+      "src": 3,
+      "dst": 0,
+      "kind": "core",
+      "length_km": 4,
+      "loss_db": 2.0,
+      "rate": "10Gbps",
+      "delay": "0.5ms"
+    },
+    {
+      "id": 301,
+      "src": 0,
+      "dst": 10,
+      "kind": "spur",
+      "rate": "1Gbps",
+      "delay": "0.2ms"
+    },
+    {
+      "id": 302,
+      "src": 1,
+      "dst": 11,
+      "kind": "spur",
+      "rate": "1Gbps",
+      "delay": "0.2ms"
+    },
+    {
+      "id": 303,
+      "src": 2,
+      "dst": 12,
+      "kind": "spur",
+      "rate": "1Gbps",
+      "delay": "0.2ms"
+    },
+    {
+      "id": 304,
+      "src": 3,
+      "dst": 13,
+      "kind": "spur",
+      "rate": "1Gbps",
+      "delay": "0.2ms"
+    }
+  ],
+
+  "traffic_profiles": {
+    "best_effort": "100Mbps",
+    "qkd_control": {
+      "pps": 40,
+      "size": 200
+    }
+  },
+
+  "defaults": {
+    "ring": true,
+    "enableMultiPath": true,
+    "maxPaths": 3
+  }
+}

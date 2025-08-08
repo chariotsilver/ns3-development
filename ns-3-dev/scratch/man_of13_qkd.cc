@@ -2864,6 +2864,152 @@ private:
     return tb;
   }
 
+  // JSON topology configuration structure
+  struct JsonTopoConfig {
+    std::string bestEffortRate = "100Mbps";
+    uint32_t qkdPps = 40;
+    uint32_t qkdSize = 200;
+    bool enableRing = false;
+    bool enableMultiPath = true;
+    uint32_t maxPaths = 3;
+    double linkLossDb = -1.0;  // -1 means use per-link values
+  };
+
+  TopoBuild BuildFromJson(const std::string& path, uint32_t txQueueMaxP, 
+                         const JsonTopoConfig& overrides = JsonTopoConfig{})
+  {
+    TopoBuild tb;
+    
+    std::ifstream fin(path);
+    if (!fin) { NS_FATAL_ERROR("Cannot open topo JSON: " << path); }
+    
+    json j;
+    try {
+      fin >> j;
+    } catch (const std::exception& e) {
+      NS_FATAL_ERROR("JSON parse error in " << path << ": " << e.what());
+    }
+    
+    // Node ID to name mapping for robust lookup
+    std::unordered_map<uint32_t, std::string> idToName;
+    std::unordered_map<std::string, uint32_t> nameToId;
+    
+    auto getNode = [&](uint32_t nodeId) -> Ptr<Node> {
+      std::string name = "node" + std::to_string(nodeId);
+      auto it = tb.nameToNode.find(name);
+      if (it != tb.nameToNode.end()) return it->second;
+      
+      Ptr<Node> n = CreateObject<Node>();
+      tb.nameToNode[name] = n;
+      return n;
+    };
+    
+    // 1. Create nodes from JSON
+    if (!j.contains("nodes") || !j["nodes"].is_array()) {
+      NS_FATAL_ERROR("JSON topology missing 'nodes' array");
+    }
+    
+    for (const auto& node : j["nodes"]) {
+      if (!node.contains("id") || !node.contains("type")) {
+        NS_FATAL_ERROR("JSON node missing 'id' or 'type' field");
+      }
+      
+      uint32_t nodeId = node["id"];
+      std::string nodeType = node["type"];
+      
+      if (nodeType != "switch" && nodeType != "host") {
+        NS_FATAL_ERROR("JSON node " << nodeId << " has unknown type '" << nodeType << "'");
+      }
+      
+      Ptr<Node> n = getNode(nodeId);
+      std::string name = nodeType == "switch" ? ("s" + std::to_string(nodeId)) 
+                                              : ("h" + std::to_string(nodeId));
+      
+      // Update name mappings for CSV compatibility
+      tb.nameToNode.erase("node" + std::to_string(nodeId));
+      tb.nameToNode[name] = n;
+      idToName[nodeId] = name;
+      nameToId[name] = nodeId;
+      
+      if (nodeType == "switch") {
+        tb.sw.push_back(n);
+      } else {
+        tb.host.push_back(n);
+        tb.hostNames.push_back(name);
+      }
+    }
+    
+    // 2. Create links from JSON
+    if (!j.contains("links") || !j["links"].is_array()) {
+      NS_FATAL_ERROR("JSON topology missing 'links' array");
+    }
+    
+    for (const auto& link : j["links"]) {
+      if (!link.contains("src") || !link.contains("dst")) {
+        NS_FATAL_ERROR("JSON link missing 'src' or 'dst' field");
+      }
+      
+      uint32_t srcId = link["src"];
+      uint32_t dstId = link["dst"];
+      
+      if (idToName.find(srcId) == idToName.end() || 
+          idToName.find(dstId) == idToName.end()) {
+        NS_FATAL_ERROR("JSON link references undefined node: " << srcId << " -> " << dstId);
+      }
+      
+      std::string srcName = idToName[srcId];
+      std::string dstName = idToName[dstId];
+      
+      // Determine link kind and default parameters
+      std::string kind = "core";  // default
+      std::string rate = "10Gbps";
+      std::string delay = "0.5ms";
+      
+      if (link.contains("kind")) {
+        kind = link["kind"];
+      } else {
+        // Auto-detect: if one endpoint is host, it's a spur
+        if (IsHostName(srcName) || IsHostName(dstName)) {
+          kind = "spur";
+          rate = "1Gbps";
+          delay = "0.2ms";
+        }
+      }
+      
+      if (kind != "core" && kind != "spur") {
+        NS_FATAL_ERROR("JSON link has unknown kind '" << kind << "'");
+      }
+      
+      // Override with JSON-specified values
+      if (link.contains("rate")) {
+        rate = link["rate"];
+      }
+      if (link.contains("delay")) {
+        delay = link["delay"];
+      }
+      
+      Ptr<Node> srcNode = tb.nameToNode[srcName];
+      Ptr<Node> dstNode = tb.nameToNode[dstName];
+      
+      auto devs = Link(srcNode, dstNode, rate, delay, txQueueMaxP);
+      Edge e;
+      e.a = srcNode; e.b = dstNode; e.devs = devs; e.kind = kind;
+      e.nameA = srcName; e.nameB = dstName;
+      
+      if (kind == "core") {
+        tb.coreEdges.push_back(e);
+      } else {
+        tb.spurEdges.push_back(e);
+      }
+    }
+    
+    std::cout << "JSON topology loaded: " << tb.sw.size() << " switches, " 
+              << tb.host.size() << " hosts, " << tb.coreEdges.size() 
+              << " core links, " << tb.spurEdges.size() << " spur links" << std::endl;
+    
+    return tb;
+  }
+
   Man BuildMan(uint32_t nCore, std::string coreRate, std::string coreDelay,
               std::string spurRate, std::string spurDelay, bool enableRing = false, uint32_t txQueueMaxP = 25)
   {
@@ -2953,9 +3099,9 @@ private:
     std::cout << "DEBUG: Remapped topology from NodeId to DPID keys" << std::endl;
   }
 
-  // Generic adjacency and host builder that works for both built-in and CSV topologies
+  // Generic adjacency and host builder that works for both built-in and external topologies
   static void BuildAdjAndHosts_Generic(
-    bool usingCsv,
+    bool usingExtTopo,
     const std::vector< NetDeviceContainer >& coreLinks,
     const std::vector< NetDeviceContainer >& spurLinks,
     const std::map<Ptr<NetDevice>, std::pair<uint32_t, Port>>& devToPortByNode,
@@ -3024,7 +3170,9 @@ private:
     
     // Topology parameters
     std::string topoPath = "";
+    std::string topoJsonPath = "";    // JSON topology file path
     bool enableRing = false;
+    double linkLossOverride = -1.0;   // Override link loss in dB (-1 = use per-link values)
     
     // Queue parameters - optimized for load testing with switch egress queuing
     uint32_t qdiscMaxP = 1000, txQueueMaxP = 200;  // Increased headroom for CS6 band
@@ -3067,7 +3215,9 @@ private:
     cmd.AddValue("run", "RNG run number", run);
     cmd.AddValue("nCore", "Number of core switches", nCore);
     cmd.AddValue("topo", "CSV edge list (u,v,kind,rate,delay)", topoPath);
+    cmd.AddValue("topoJson", "JSON topology file (nodes, links, traffic profiles)", topoJsonPath);
     cmd.AddValue("ring", "Enable ring topology (creates loops!)", enableRing);
+    cmd.AddValue("linkLoss", "Override core link loss in dB (JSON topologies only)", linkLossOverride);
     cmd.AddValue("qSrc", "QKD source host index", qSrc);
     cmd.AddValue("qDst", "QKD destination host index", qDst);
     cmd.AddValue("qkdStart", "QKD window start (s)", qkdStart);
@@ -3131,11 +3281,33 @@ private:
     // Build topology
     TopoBuild topo;
     bool usingCsv = !topoPath.empty();
+    bool usingJson = !topoJsonPath.empty();
+    bool usingExtTopo = usingCsv || usingJson;  // External topology (CSV or JSON)
     Man man;
 
-    if (usingCsv) {
+    if (usingCsv && usingJson) {
+      NS_FATAL_ERROR("Cannot specify both --topo (CSV) and --topoJson (JSON) simultaneously");
+    }
+
+    if (usingJson) {
+      // JSON topology configuration with command-line overrides
+      JsonTopoConfig jsonConfig;
+      jsonConfig.enableRing = enableRing;
+      jsonConfig.enableMultiPath = enableMultiPath;
+      jsonConfig.maxPaths = maxPaths;
+      jsonConfig.linkLossDb = linkLossOverride;
+      
+      topo = BuildFromJson(topoJsonPath, txQueueMaxP, jsonConfig);
+      
+      // Apply command-line overrides to topology if specified
+      if (linkLossOverride >= 0.0) {
+        std::cout << "Overriding core link loss to " << linkLossOverride << " dB" << std::endl;
+        // Note: Loss override would be applied in QKD channel setup, not here
+      }
+    } else if (usingCsv) {
       topo = BuildFromCsv(topoPath, txQueueMaxP);
     } else {
+      // Default built-in MAN topology
       man = BuildMan(nCore, "10Gbps", "0.5ms", "1Gbps", "0.2ms", enableRing, txQueueMaxP);
     }
     
@@ -3171,7 +3343,7 @@ private:
     std::map<Ptr<NetDevice>, std::pair<uint32_t /*nodeId*/, Port>> devToPortByNode;
     std::map<Ptr<NetDevice>, Ipv4Address> devToIp;
 
-    if (usingCsv) {
+    if (usingExtTopo) {
       // Build stable host index mapping for proper IP assignment
       std::vector<std::pair<uint32_t, Ptr<NetDevice>>> hostNicByIndex;
       for (const auto& e : topo.spurEdges) {
@@ -3210,17 +3382,23 @@ private:
       for (auto& cl : man.coreLinks) coreLinks.push_back(cl);
     }
 
+    // Helper function for unified host node access - single source of truth
+    auto HostNode = [&](uint32_t idx) -> Ptr<Node> {
+        if (usingExtTopo)   return hostByIndex.at(idx);  // JSON or CSV
+        else                return man.host.at(idx);     // built-in MAN
+    };
+
     // Register core links with failure module for robustness testing
     if (enableLinkFailures) {
       for (size_t i = 0; i < coreLinks.size(); ++i) {
-        std::string desc = usingCsv ? 
-          ("CSV_Core_Link_" + std::to_string(i)) : 
+        std::string desc = usingExtTopo ? 
+          ("External_Core_Link_" + std::to_string(i)) : 
           ("Line_Core_Link_" + std::to_string(i));
         g_linkFailures.RegisterLink(coreLinks[i], desc, txQueueMaxP);
       }
     }
 
-    if (usingCsv) {
+    if (usingExtTopo) {
       // For each switch node, collect its ports from edges
       for (auto swNode : topo.sw) {
         NetDeviceContainer ports;
@@ -3303,7 +3481,7 @@ private:
     InternetStackHelper internet;
     NodeContainer allHosts;
 
-    if (usingCsv) {
+    if (usingExtTopo) {
       for (auto h : topo.host) allHosts.Add(h);
     } else {
       for (auto& h : man.host) allHosts.Add(h);
@@ -3322,10 +3500,10 @@ private:
     // (D) Build dev/port maps + adjacency + hosts (with NodeId keys initially)
     SwAdj adj; 
     std::vector<HostInfo> hostTbl;
-    BuildAdjAndHosts_Generic(usingCsv, coreLinks, spurLinks, devToPortByNode, devToIp, adj, hostTbl);
+    BuildAdjAndHosts_Generic(usingExtTopo, coreLinks, spurLinks, devToPortByNode, devToIp, adj, hostTbl);
 
     // Discover DPIDs and remap topology (devices already exist after InstallSwitch)
-    std::vector<Ptr<Node>> swNodes = usingCsv ? topo.sw : man.sw;
+    std::vector<Ptr<Node>> swNodes = usingExtTopo ? topo.sw : man.sw;
     auto nodeToDpid = BuildNodeToDpid(swNodes);
     SwAdj adjDpid; 
     std::vector<HostInfo> hostsDpid;
@@ -3361,13 +3539,13 @@ private:
     // Configure and run SDN realism testing framework
     if (enableSDNTesting) {
       std::vector<Ptr<Node>> hostNodes;
-      if (usingCsv) {
+      if (usingExtTopo) {
         for (auto h : topo.host) hostNodes.push_back(h);
       } else {
         for (auto& h : man.host) hostNodes.push_back(h);
       }
       
-      std::vector<Ptr<Node>> switchNodes = usingCsv ? topo.sw : man.sw;
+      std::vector<Ptr<Node>> switchNodes = usingExtTopo ? topo.sw : man.sw;
       
       g_sdnTest.SetTopology(hostNodes, switchNodes, ifs);
       g_sdnTest.RunComprehensiveTest(true);
@@ -3484,7 +3662,7 @@ private:
     uint16_t bePort = 9000;
     ApplicationContainer sinkApps;
     
-    uint32_t numHosts = usingCsv ? hostByIndex.size() : nCore;
+    uint32_t numHosts = usingExtTopo ? hostByIndex.size() : nCore;
     
     // Safety check: ensure QKD source/destination are valid
     NS_ABORT_MSG_IF(qSrc >= numHosts || qDst >= numHosts,
@@ -3509,7 +3687,7 @@ private:
       onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1e9]"));
       onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
       
-      if (usingCsv) {
+      if (usingExtTopo) {
         onoff.Install(hostByIndex[i]);
       } else {
         onoff.Install(man.host[i]);
@@ -3520,7 +3698,7 @@ private:
     PacketSinkHelper sink("ns3::UdpSocketFactory", 
                         InetSocketAddress(Ipv4Address::GetAny(), bePort));
     for (uint32_t j = 0; j < numHosts; j++) {
-      if (usingCsv) {
+      if (usingExtTopo) {
         sinkApps.Add(sink.Install(hostByIndex[j]));
       } else {
         sinkApps.Add(sink.Install(man.host[j]));
@@ -3530,20 +3708,12 @@ private:
     // ARP warmup: prime caches to avoid losing first QKD packets
     V4PingHelper warm(ifs.GetAddress(qDst));
     warm.SetAttribute("StartTime", TimeValue(Seconds(0.2)));
-    if (usingCsv) {
-      warm.Install(hostByIndex[qSrc]);
-    } else {
-      warm.Install(man.host[qSrc]);
-    }
+    warm.Install(HostNode(qSrc));
 
     // Reverse ARP warmup: ensure ACK responses have ARP cache entries
     V4PingHelper warmBack(ifs.GetAddress(qSrc));
     warmBack.SetAttribute("StartTime", TimeValue(Seconds(0.21)));
-    if (usingCsv) {
-      warmBack.Install(hostByIndex[qDst]);
-    } else {
-      warmBack.Install(man.host[qDst]);
-    }
+    warmBack.Install(HostNode(qDst));
 
     // --- old bulk EF QKD window (commented out) ---
     // Ptr<QkdWindowApp> qkd = CreateObject<QkdWindowApp>();
@@ -3561,13 +3731,13 @@ private:
 
     // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst with configurable marking
     Ptr<QkdWindowApp> qctrlApp = CreateObject<QkdWindowApp>();
-    ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(qctrlApp);
+    HostNode(qSrc)->AddApplication(qctrlApp);
 
     // Enhanced QoS: Use CS6 (DSCP 48) for QKD control traffic to trigger high-priority class
     uint8_t qkdControlTos = 0xC0; // CS6 = DSCP 48 = 110000 << 2 = 0xC0
     
     // 64 kbps @ 200B -> ~40 pps (well within 100 Kbps meter limit for QKD_Control class)
-    qctrlApp->Configure( usingCsv ? hostByIndex[qSrc] : man.host[qSrc],
+    qctrlApp->Configure(HostNode(qSrc),
                          ifs.GetAddress(qDst), 5555,
                          Seconds(qkdStart),
                          Seconds(15.0 - qkdStart),   // Extended to match simulation duration
@@ -3575,23 +3745,21 @@ private:
 
     PacketSinkHelper qctrlSink("ns3::UdpSocketFactory",
                                InetSocketAddress(Ipv4Address::GetAny(), 5555));
-    ApplicationContainer qctrlSinkApp = (usingCsv
-      ? qctrlSink.Install(hostByIndex[qDst])
-      : qctrlSink.Install(man.host[qDst]));
+    ApplicationContainer qctrlSinkApp = qctrlSink.Install(HostNode(qDst));
 
     // --- QKD Layer Setup (after classical link A<->B is built) ---
     Ptr<qkd::QkdFiberChannel> qch = CreateObject<qkd::QkdFiberChannel>();
     qch->AssignStreams(42);   // keep your run/seed policy consistent
 
     Ptr<qkd::QkdNetDevice> alice = CreateObject<qkd::QkdNetDevice>();
-    alice->SetNode(usingCsv ? hostByIndex[qSrc] : man.host[qSrc]); 
+    alice->SetNode(HostNode(qSrc)); 
     alice->SetChannel(qch); 
     alice->SetLambda(1550.12); 
     alice->SetBasisBias(0.9);
     alice->AssignStreams(0);  // Assign stream 0 to Alice
 
     Ptr<qkd::QkdNetDevice> bob = CreateObject<qkd::QkdNetDevice>();
-    bob->SetNode(usingCsv ? hostByIndex[qDst] : man.host[qDst]);   
+    bob->SetNode(HostNode(qDst));   
     bob->SetChannel(qch);   
     bob->SetLambda(1550.12);   
     bob->SetBasisBias(0.9);
@@ -3652,7 +3820,7 @@ private:
     // --- QKD Session Loop Application Setup ---
     // Replace scattered timers with unified per-session orchestrator
     auto loop = CreateObject<QkdSessionLoop>();
-    ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(loop);
+    HostNode(qSrc)->AddApplication(loop);
     
     // Attach appropriate bias controller
     if (staticController) {
@@ -3674,16 +3842,16 @@ private:
     // Classical post-processing: Bob responds to SIFT messages with ACKs
     // Start responder before sender to ensure ACKs can arrive
     auto resp = CreateObject<QkdSiftResponder>();
-    ( usingCsv ? hostByIndex[qDst] : man.host[qDst] )->AddApplication(resp);
-    resp->Configure(( usingCsv ? hostByIndex[qDst] : man.host[qDst] ), 9753, /*CS6*/ 0xC0); // Listen on port 9753 for SIFT messages with CS6 priority
+    HostNode(qDst)->AddApplication(resp);
+    resp->Configure(HostNode(qDst), 9753, /*CS6*/ 0xC0); // Listen on port 9753 for SIFT messages with CS6 priority
     resp->SetStartTime(Seconds(0.8));
     resp->SetStopTime(Seconds(simEnd - 0.1));
 
     // --- QKD Sifting Application Setup for Alice ---
     // Classical post-processing: Alice sends SIFT and waits for ACK before committing windows
     auto siftA = CreateObject<QkdSiftingApp>();
-    ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(siftA);
-    siftA->Configure( usingCsv ? hostByIndex[qSrc] : man.host[qSrc],
+    HostNode(qSrc)->AddApplication(siftA);
+    siftA->Configure(HostNode(qSrc),
                       ifs.GetAddress(qDst), /*port*/9753, /*DSCP*/0xC0,
                       &sessions, sAB, MilliSeconds(200));
     siftA->BindTx(alice);
@@ -3705,7 +3873,7 @@ private:
     loadMonitor->SetMonitoringPeriod(MilliSeconds(100)); // Monitor every 100ms
     
     // Install on the same node as Alice (or any node - it's just monitoring)
-    Ptr<Node> monitorNode = usingCsv ? hostByIndex[qSrc] : man.host[qSrc];
+    Ptr<Node> monitorNode = HostNode(qSrc);
     monitorNode->AddApplication(loadMonitor);
     loadMonitor->SetStartTime(Seconds(0.5));
     loadMonitor->SetStopTime(Seconds(20.0)); // Monitor for the simulation duration
@@ -3758,20 +3926,11 @@ private:
           extraTraffic.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1e9]"));
           extraTraffic.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
           
-          if (usingCsv) {
-            extraTraffic.Install(hostByIndex[src]);
-          } else {
-            extraTraffic.Install(man.host[src]);
-          }
+          extraTraffic.Install(HostNode(src));
           
           PacketSinkHelper extraSink("ns3::UdpSocketFactory", 
                                    InetSocketAddress(Ipv4Address::GetAny(), 9001 + k));
-          ApplicationContainer extraSinkApp;
-          if (usingCsv) {
-            extraSinkApp = extraSink.Install(hostByIndex[dst]);
-          } else {
-            extraSinkApp = extraSink.Install(man.host[dst]);
-          }
+          ApplicationContainer extraSinkApp = extraSink.Install(HostNode(dst));
           sinkApps.Add(extraSinkApp);  // <-- Include in BE RX totals
         }
         

@@ -1,0 +1,65 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "type": "switch",
+      "name": "sw0"
+    },
+    {
+      "id": 1,
+      "type": "switch", 
+      "name": "sw1"
+    },
+    {
+      "id": 2,
+      "type": "host",
+      "name": "host0"
+    },
+    {
+      "id": 3,
+      "type": "host",
+      "name": "host1"
+    }
+  ],
+  "links": [
+    {
+      "src": 0,
+      "dst": 1,
+      "type": "core",
+      "bandwidth": "1Gbps",
+      "delay": "2ms"
+    },
+    {
+      "src": 0,
+      "dst": 2,
+      "type": "spur",
+      "bandwidth": "1Gbps",
+      "delay": "1ms"
+    },
+    {
+      "src": 1,
+      "dst": 3,
+      "type": "spur", 
+      "bandwidth": "1Gbps",
+      "delay": "1ms"
+    }
+  ],
+  "traffic_profiles": [
+    {
+      "name": "qkd_control",
+      "src": 2,
+      "dst": 3,
+      "protocol": "UDP",
+      "start_time": "0.5s",
+      "data_rate": "1Kbps",
+      "packet_size": 64
+    }
+  ],
+  "defaults": {
+    "bandwidth": "1Gbps",
+    "delay": "1ms",
+    "qkd_distance": 25.0,
+    "fiber_loss": 0.2,
+    "detector_efficiency": 0.8
+  }
+}
