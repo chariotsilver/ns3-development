@@ -18,6 +18,23 @@
 #include "ns3/random-variable-stream.h"
 #include "ns3/rng-seed-manager.h"
 #include "ns3/type-id.h"
+
+/*─────────────────────────────
+▶ Purpose: headers & tiny helper
+─────────────────────────────*/
+#include <nlohmann/json.hpp>   // already in tree for Phase-0
+#include <map>
+#include <set>
+#include <fstream>
+#include <sstream>
+
+static std::string
+ReadFile(const std::string& path)
+{
+  std::ifstream in(path.c_str());
+  std::ostringstream ss;  ss << in.rdbuf();
+  return ss.str();
+}
 #include <fstream>
 #include <sstream>
 #include <set>
@@ -45,6 +62,36 @@ using nlohmann::json;
 // When false, BiasController also sends observations (legacy mode)
 static bool g_obsFromSiftingOnly = true;
 
+/*─────────────────────────────
+▶ Purpose: multi-hop QKD topology data structures
+─────────────────────────────*/
+namespace ns3 { namespace qkd {
+
+// Configuration for a single quantum link
+struct QkdLinkConfig {
+  uint32_t linkId;      // Unique link identifier
+  uint32_t srcNode;     // Source node index
+  uint32_t dstNode;     // Destination node index
+  double lengthKm;      // Physical length in kilometers
+  double lossDb;        // Attenuation in dB
+  double lambdaNm;      // Wavelength in nanometers (default 1550.0)
+};
+
+// Forward declarations
+class QkdFiberChannel;
+class QkdNetDevice;
+class ClassicalMonitor;
+
+// Complete quantum network topology
+struct QkdTopology {
+  std::vector<QkdLinkConfig> linkConfigs;
+  std::map<uint32_t, Ptr<QkdFiberChannel>> channels;     // linkId -> channel
+  std::map<uint32_t, std::pair<Ptr<QkdNetDevice>, Ptr<QkdNetDevice>>> devices; // linkId -> (devA, devB)
+  std::map<uint32_t, Ptr<ClassicalMonitor>> monitors;    // linkId -> monitor
+};
+
+}} // ns3::qkd
+
 // QKD: Fiber channel (shared span, WDM-aware)
 namespace ns3 { namespace qkd {
 
@@ -62,13 +109,34 @@ public:
   void SetLinkId(uint32_t linkId) { m_linkId = linkId; }
   uint32_t GetLinkId() const { return m_linkId; }
   
+  // Physical parameters for topology builder
+  void SetLengthKm(double lengthKm) { m_lenKm = lengthKm; }
+  void SetAttenuationDb(double lossDb) { m_lossDb = lossDb; }
+  void SetLambdaNm(double lambdaNm) { m_lambdaNm = lambdaNm; }
+  double GetLengthKm() const { return m_lenKm; }
+  double GetAttenuationDb() const { return m_lossDb; }
+  double GetLambdaNm() const { return m_lambdaNm; }
+  
   struct BatchOutcome { uint32_t nTx, nLost, nDepol; };
   BatchOutcome Propagate(uint32_t nPulses, double lambdaNm, double baseDepol); // batch sim
   int64_t AssignStreams(int64_t stream);                      // tie RNG to ns-3 streams
+  
+  /*─────────────────────────────
+  ▶ Purpose: expose QBER to monitor
+  ─────────────────────────────*/
+  double GetCurrentQber()  const { return m_qberInstant; }
+  double GetAverageQber()  const { return m_qberEwma; }
+  // UpdateClassicalLoad already exists above
+  
   // Channel plumbing:
   std::size_t GetNDevices() const override; Ptr<NetDevice> GetDevice(std::size_t i) const override;
 private:
   uint32_t m_linkId = 0;  // Unique identifier for this quantum link
+  double m_lambdaNm = 1550.0;  // Default wavelength for topology builder
+  
+  // QBER tracking for monitors
+  double m_qberInstant = 0.0;  // Current window QBER
+  double m_qberEwma = 0.0;     // Exponentially weighted moving average QBER
   struct Port { Ptr<NetDevice> dev; double lambdaNm; double mbps=0.0; };
   std::vector<Port> m_ports;
   std::unordered_map<double,double> m_sidebandLoads; // λ -> Mbps (no attached dev required)
@@ -129,17 +197,20 @@ public:
     }
   }
 
+  /*─────────────────────────────
+  ▶ Purpose: JSONL schema polish
+  ─────────────────────────────*/
   void LogWindow(const WindowStats& s) {
     if (!m_out.is_open()) return;
     
     m_out << "{"
-          << "\"ts\":" << Simulator::Now().GetSeconds() << ","
-          << "\"linkId\":" << s.linkId << ","
-          << "\"winId\":" << s.winId << ","
-          << "\"keyRate_bps\":" << s.keyRate_bps << ","
-          << "\"qber\":" << s.qber << ","
-          << "\"classLoad_bps\":" << s.classicalLoad_bps << ","
-          << "\"pZ_tx\":" << s.pZ_tx
+          << "\"timestamp\":"        << Simulator::Now().GetSeconds() << ","
+          << "\"linkId\":"          << s.linkId                       << ","
+          << "\"winId\":"           << s.winId                        << ","
+          << "\"keyRate_bps\":"     << s.keyRate_bps                  << ","
+          << "\"qber\":"            << s.qber                         << ","
+          << "\"classicalLoad_bps\":"<< s.classicalLoad_bps           << ","
+          << "\"pZ_tx\":"           << s.pZ_tx
           << "}\n";
     m_out.flush();  // Ensure data is written immediately for real-time monitoring
   }
@@ -189,6 +260,48 @@ public:
 private:
   Ptr<QkdFiberChannel> m_ch; 
   double m_lambda;
+};
+
+/*─────────────────────────────
+▶ Purpose: EWMA load → quantum crosstalk
+─────────────────────────────*/
+class ClassicalMonitor : public Object
+{
+public:
+  static TypeId GetTypeId();
+
+  ClassicalMonitor() = default;  // Required for NS-3 TypeId system
+  ClassicalMonitor(uint32_t linkId,
+                   Ptr<QkdFiberChannel> quantum,
+                   double lambdaClassical = 1530.0);
+
+  void AttachToDevice(Ptr<NetDevice> dev);
+
+  // test-only helper
+  void InjectTestLoad(double bps);
+
+  ~ClassicalMonitor() override;
+
+private:
+  void OnPacketTx(Ptr<NetDevice>, Ptr<const Packet>, uint16_t,
+                  const Address&, const Address&, NetDevice::PacketType);
+  void UpdateWindow();
+  void DriveTestLoad();
+
+  uint32_t            m_linkId = 0;
+  Ptr<QkdFiberChannel> m_q = nullptr;
+  double              m_lambdaC = 1530.0;
+
+  Time                m_win{MilliSeconds(100)};
+  double              m_alpha{0.2};
+
+  uint64_t            m_bytesWin{0};
+  double              m_loadInst{0};
+  double              m_loadEwma{0};
+
+  EventId             m_evtUpd;
+  double              m_testBps{0};
+  EventId             m_evtTest;
 };
 
 // QKD: NetDevice (quantum module on a node)
@@ -685,6 +798,194 @@ public:
 private:
   int m_fd = -1;
 };
+
+/*─────────────────────────────
+▶ Purpose: load measurement & QBER penalty
+─────────────────────────────*/
+TypeId
+ClassicalMonitor::GetTypeId()
+{
+  static TypeId tid = TypeId("ns3::qkd::ClassicalMonitor")
+      .SetParent<Object>()
+      .AddConstructor<ClassicalMonitor>();
+  return tid;
+}
+
+ClassicalMonitor::ClassicalMonitor(uint32_t id,
+                                   Ptr<QkdFiberChannel> q,
+                                   double lambda)
+  : m_linkId(id), m_q(q), m_lambdaC(lambda)
+{
+  m_evtUpd = Simulator::Schedule(m_win,
+      MakeCallback(&ClassicalMonitor::UpdateWindow, this));
+}
+
+ClassicalMonitor::~ClassicalMonitor()
+{
+  if (m_evtUpd.IsRunning())  Simulator::Cancel(m_evtUpd);
+  if (m_evtTest.IsRunning()) Simulator::Cancel(m_evtTest);
+}
+
+void
+ClassicalMonitor::AttachToDevice(Ptr<NetDevice> dev)
+{
+  dev->TraceConnectWithoutContext("PhyTxEnd",
+      MakeCallback(&ClassicalMonitor::OnPacketTx, this));
+}
+
+void
+ClassicalMonitor::InjectTestLoad(double bps)
+{
+  m_testBps = bps;
+  if (!m_evtTest.IsRunning())
+    m_evtTest = Simulator::Schedule(MicroSeconds(0),
+        MakeCallback(&ClassicalMonitor::DriveTestLoad, this));
+}
+
+void
+ClassicalMonitor::OnPacketTx(Ptr<NetDevice>, Ptr<const Packet> p,
+                             uint16_t, const Address&,
+                             const Address&, NetDevice::PacketType)
+{
+  m_bytesWin += p->GetSize();
+}
+
+void
+ClassicalMonitor::UpdateWindow()
+{
+  m_loadInst = (m_bytesWin * 8.0) / m_win.GetSeconds();
+  m_loadEwma = m_alpha * m_loadInst + (1.0 - m_alpha) * m_loadEwma;
+  m_bytesWin = 0;
+
+  if (m_q) m_q->UpdateClassicalLoad(m_lambdaC, m_loadEwma);
+
+  m_evtUpd = Simulator::Schedule(m_win,
+      MakeCallback(&ClassicalMonitor::UpdateWindow, this));
+}
+
+/* test pump: emit virtual packets to simulate load */
+void
+ClassicalMonitor::DriveTestLoad()
+{
+  if (m_testBps <= 0) return;
+  uint32_t size = 1200;
+  double interval = size * 8.0 / m_testBps;
+  Ptr<Packet> pkt = Create<Packet>(size);
+  OnPacketTx(nullptr, pkt, 0, Address(), Address(), NetDevice::PACKET_HOST);
+  m_evtTest = Simulator::Schedule(Seconds(interval),
+      MakeCallback(&ClassicalMonitor::DriveTestLoad, this));
+}
+
+/*─────────────────────────────
+▶ Purpose: fabric factory (JSON + grid)
+─────────────────────────────*/
+class QkdTopologyBuilder : public Object
+{
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("ns3::qkd::QkdTopologyBuilder")
+        .SetParent<Object>()
+        .AddConstructor<QkdTopologyBuilder>();
+    return tid;
+  }
+
+  QkdTopology BuildFromJson(const nlohmann::json& j,
+                            const std::vector<Ptr<Node>>& nodes) {
+    std::vector<QkdLinkConfig> links;
+    uint32_t id = 0;
+    for (const auto& e : j["links"])
+      links.push_back({ id++,
+                        e["src"], e["dst"],
+                        e["length_km"], e["loss_db"],
+                        e.value("lambda_nm", 1550.0) });
+    return Build(links, nodes);
+  }
+
+  QkdTopology BuildMadridGrid(uint32_t n = 3, double km = 5.0) {
+    std::vector<QkdLinkConfig> links;
+    uint32_t id = 0;
+    auto idx=[n](uint32_t r,uint32_t c){return r*n+c;};
+
+    for(uint32_t r=0;r<n;++r)
+      for(uint32_t c=0;c<n;++c){
+        if(c+1<n) links.push_back({id++,idx(r,c),idx(r,c+1),km,0.25*km,1550});
+        if(r+1<n) links.push_back({id++,idx(r,c),idx(r+1,c),km,0.25*km,1550});
+      }
+    
+    // Create nodes for the grid
+    std::vector<Ptr<Node>> nodes;
+    for(uint32_t i = 0; i < n*n; ++i) {
+      nodes.push_back(CreateObject<Node>());
+    }
+    return Build(links, nodes);
+  }
+
+  void AttachClassicalMonitoring(QkdTopology& topo,
+      const std::map<uint32_t /*linkId*/, NetDeviceContainer>& classicalLinks) {
+    for (const auto& kv : classicalLinks)
+    {
+      uint32_t lid = kv.first;
+      const auto& devs = kv.second;
+
+      Ptr<ClassicalMonitor> mon =
+          CreateObject<ClassicalMonitor>(lid, topo.channels.at(lid));
+      topo.monitors[lid] = mon;
+
+      for (uint32_t i = 0; i < devs.GetN(); ++i)
+        mon->AttachToDevice(devs.Get(i));
+    }
+  }
+
+private:
+  QkdTopology Build(const std::vector<QkdLinkConfig>& links,
+                    const std::vector<Ptr<Node>>& nodes) {
+    QkdTopology topo;
+    topo.linkConfigs = links;
+
+    for (const auto& cfg : links)
+    {
+      Ptr<QkdFiberChannel> chan = MakeQuantum(cfg);
+      topo.channels[cfg.linkId] = chan;
+
+      auto devPair = MakeQkdDevices(cfg,
+                                    nodes.at(cfg.srcNode),
+                                    nodes.at(cfg.dstNode),
+                                    chan);
+      topo.devices[cfg.linkId] = devPair;
+    }
+    return topo;
+  }
+
+  Ptr<QkdFiberChannel> MakeQuantum(const QkdLinkConfig& cfg) {
+    Ptr<QkdFiberChannel> f = CreateObject<QkdFiberChannel>();
+    f->SetLinkId(cfg.linkId);
+    f->SetLengthKm(cfg.lengthKm);
+    f->SetAttenuationDb(cfg.lossDb);
+    f->SetLambdaNm(cfg.lambdaNm);
+    f->AssignStreams(cfg.linkId + 1000); // Ensure unique RNG streams
+    return f;
+  }
+
+  std::pair<Ptr<QkdNetDevice>, Ptr<QkdNetDevice>>
+    MakeQkdDevices(const QkdLinkConfig& cfg,
+                   Ptr<Node> a, Ptr<Node> b,
+                   Ptr<QkdFiberChannel> chan) {
+    Ptr<QkdNetDevice> devA = CreateObject<QkdNetDevice>();
+    Ptr<QkdNetDevice> devB = CreateObject<QkdNetDevice>();
+    devA->SetChannel(chan);
+    devB->SetChannel(chan);
+    devA->SetLambda(cfg.lambdaNm);
+    devB->SetLambda(cfg.lambdaNm);
+    devA->SetBasisBias(0.9); // Default basis bias
+    devB->SetBasisBias(0.9);
+    devA->AssignStreams(cfg.linkId * 2); // Unique streams per device
+    devB->AssignStreams(cfg.linkId * 2 + 1);
+    a->AddDevice(devA);
+    b->AddDevice(devB);
+    return {devA, devB};
+  }
+};
+
 }} // ns3::qkd
 
 // --- QKD: Bias Controller per-session (basis bias + route hooks) ------------------
