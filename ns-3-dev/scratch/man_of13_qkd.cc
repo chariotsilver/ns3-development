@@ -56,6 +56,7 @@ public:
   static TypeId GetTypeId(); QkdFiberChannel();
   void Attach(Ptr<NetDevice> dev, double lambdaNm);           // register device+λ
   void UpdateClassicalLoad(double lambdaNm, double mbps);     // feed classical Mbps
+  double GetClassicalLoad(double lambdaNm) const;             // retrieve current load
   struct BatchOutcome { uint32_t nTx, nLost, nDepol; };
   BatchOutcome Propagate(uint32_t nPulses, double lambdaNm, double baseDepol); // batch sim
   int64_t AssignStreams(int64_t stream);                      // tie RNG to ns-3 streams
@@ -72,6 +73,66 @@ private:
 
 // QKD: NetDevice (quantum module on a node)
 struct QkdStats { uint32_t nXX=0, nZZ=0, errX=0, errZ=0; double qberX=0.0; };
+
+// QKD: Meta Logger for ML Training Pipeline (JSONL telemetry sink)
+struct WindowStats {
+  uint32_t linkId;
+  uint64_t winId;
+  double keyRate_bps;
+  double qber;
+  double classicalLoad_bps;
+  double pZ_tx;
+};
+
+class MetaLogger : public Object {
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("ns3::qkd::MetaLogger")
+                          .SetParent<Object>()
+                          .SetGroupName("QKD");
+    return tid;
+  }
+
+  MetaLogger() {
+    // Default constructor - file will be opened when SetFilename is called
+  }
+
+  void SetFilename(const std::string& filename) {
+    if (m_out.is_open()) {
+      m_out.close();
+    }
+    m_out.open(filename, std::ios::out | std::ios::trunc);
+    if (!m_out.is_open()) {
+      std::cerr << "MetaLogger: Failed to open " << filename << " for writing" << std::endl;
+    } else {
+      std::cout << "MetaLogger: Logging to " << filename << std::endl;
+    }
+  }
+
+  void LogWindow(const WindowStats& s) {
+    if (!m_out.is_open()) return;
+    
+    m_out << "{"
+          << "\"ts\":" << Simulator::Now().GetSeconds() << ","
+          << "\"linkId\":" << s.linkId << ","
+          << "\"winId\":" << s.winId << ","
+          << "\"keyRate_bps\":" << s.keyRate_bps << ","
+          << "\"qber\":" << s.qber << ","
+          << "\"classLoad_bps\":" << s.classicalLoad_bps << ","
+          << "\"pZ_tx\":" << s.pZ_tx
+          << "}\n";
+    m_out.flush();  // Ensure data is written immediately for real-time monitoring
+  }
+
+  ~MetaLogger() {
+    if (m_out.is_open()) {
+      m_out.close();
+    }
+  }
+
+private:
+  std::ofstream m_out;
+};
 
 // QKD: Security helpers (M1 + finite-key estimate)
 inline bool PassesM1(uint32_t nXX, uint32_t N){ return nXX >= (uint32_t)std::ceil(std::log2(std::max(1u,N))); }
@@ -200,6 +261,7 @@ private:
 namespace ns3 { namespace qkd {
 
 NS_OBJECT_ENSURE_REGISTERED (QkdFiberChannel);
+NS_OBJECT_ENSURE_REGISTERED (MetaLogger);
 
 TypeId QkdFiberChannel::GetTypeId ()
 {
@@ -247,6 +309,18 @@ void QkdFiberChannel::UpdateClassicalLoad (double lambdaNm, double mbps)
     if (std::abs (p.lambdaNm - lambdaNm) < 1e-6) { p.mbps = mbps; matched = true; break; }
   }
   if (!matched) { m_sidebandLoads[lambdaNm] = mbps; }
+}
+
+double QkdFiberChannel::GetClassicalLoad (double lambdaNm) const
+{
+  // Check ports first
+  for (const auto &p : m_ports) {
+    if (std::abs (p.lambdaNm - lambdaNm) < 1e-6) { return p.mbps; }
+  }
+  // Check sideband loads
+  auto it = m_sidebandLoads.find(lambdaNm);
+  if (it != m_sidebandLoads.end()) { return it->second; }
+  return 0.0; // No load found for this wavelength
 }
 
 // Gaussian-weighted Raman/crosstalk from other λ, scaled by their Mbps
@@ -855,6 +929,37 @@ private:
       if (m_ml->TryRecvAct(act) && act.hasPz) {
         m_tx->SetTxBasisBias(act.pZ);
       }
+    }
+
+    // Log window stats to MetaLogger for ML training pipeline
+    Ptr<qkd::MetaLogger> logger = Names::Find<qkd::MetaLogger>("meta");
+    if (logger) {
+      // Calculate key rate based on estimated secret bits
+      uint32_t secretBits = qkd::EstimateSecretBits(pw->second.nZZ, pw->second.qberX);
+      double keyRate_bps = secretBits / m_winPeriod.GetSeconds();
+      
+      // Get classical load from the QKD channel
+      double classicalLoad_bps = 0.0;
+      if (m_tx) {
+        Ptr<qkd::QkdFiberChannel> qch = DynamicCast<qkd::QkdFiberChannel>(m_tx->GetChannel());
+        if (qch) {
+          classicalLoad_bps = qch->GetClassicalLoad(1530.0) * 1e6; // Convert Mbps to bps
+        }
+      }
+      
+      // Get current Tx bias
+      auto [pZtx, pZrx] = m_tx->GetBiases();
+      
+      qkd::WindowStats ws{
+        static_cast<uint32_t>(m_sid.src), // linkId (using source node ID)
+        m.winId,
+        keyRate_bps,
+        pw->second.qberX,
+        classicalLoad_bps,
+        pZtx
+      };
+      
+      logger->LogWindow(ws);
     }
 
     // Housekeeping
@@ -3394,6 +3499,14 @@ private:
     bool mlOK = false;
     if (enableMlBridge) mlOK = ml.Connect(mlHost, mlPort);
     std::cout << "ML bridge " << (mlOK ? "connected" : "not connected") << std::endl;
+    
+    // --- MetaLogger Setup ---
+    // Centralized telemetry sink for ML training pipeline
+    std::string runId = std::to_string(run);
+    Ptr<qkd::MetaLogger> meta = CreateObject<qkd::MetaLogger>();
+    meta->SetFilename("run-" + runId + ".jsonl");
+    ns3::Names::Add("meta", meta);
+    std::cout << "MetaLogger initialized: run-" << runId << ".jsonl" << std::endl;
     
     // --- QKD Session Loop Application Setup ---
     // Replace scattered timers with unified per-session orchestrator
