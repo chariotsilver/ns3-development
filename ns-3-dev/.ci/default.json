@@ -1,0 +1,29 @@
+{
+  "nodes": [
+    {"id": 0, "type": "switch", "name": "sw0"},
+    {"id": 1, "type": "switch", "name": "sw1"},
+    {"id": 2, "type": "switch", "name": "sw2"},
+    {"id": 3, "type": "switch", "name": "sw3"},
+    {"id": 10, "type": "host", "name": "host0"},
+    {"id": 11, "type": "host", "name": "host1"},
+    {"id": 12, "type": "host", "name": "host2"},
+    {"id": 13, "type": "host", "name": "host3"}
+  ],
+  "links": [
+    {"src": 0, "dst": 1, "type": "core", "bandwidth": "10Gbps", "delay": "0.5ms"},
+    {"src": 1, "dst": 2, "type": "core", "bandwidth": "10Gbps", "delay": "0.5ms"},
+    {"src": 2, "dst": 3, "type": "core", "bandwidth": "10Gbps", "delay": "0.5ms"},
+    {"src": 3, "dst": 0, "type": "core", "bandwidth": "10Gbps", "delay": "0.5ms"},
+    {"src": 0, "dst": 10, "type": "spur", "bandwidth": "1Gbps", "delay": "0.2ms"},
+    {"src": 1, "dst": 11, "type": "spur", "bandwidth": "1Gbps", "delay": "0.2ms"},
+    {"src": 2, "dst": 12, "type": "spur", "bandwidth": "1Gbps", "delay": "0.2ms"},
+    {"src": 3, "dst": 13, "type": "spur", "bandwidth": "1Gbps", "delay": "0.2ms"}
+  ],
+  "defaults": {
+    "bandwidth": "1Gbps",
+    "delay": "1ms",
+    "qkd_distance": 25.0,
+    "fiber_loss": 0.2,
+    "detector_efficiency": 0.8
+  }
+}

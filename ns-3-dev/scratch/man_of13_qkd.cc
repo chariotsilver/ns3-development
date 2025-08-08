@@ -3715,19 +3715,6 @@ private:
     warmBack.SetAttribute("StartTime", TimeValue(Seconds(0.21)));
     warmBack.Install(HostNode(qDst));
 
-    // --- old bulk EF QKD window (commented out) ---
-    // Ptr<QkdWindowApp> qkd = CreateObject<QkdWindowApp>();
-    // if (usingCsv) {
-    //   hostByIndex[qSrc]->AddApplication(qkd);
-    //   qkd->Configure(hostByIndex[qSrc], ifs.GetAddress(qDst), /*dport*/ 5555,
-    //                 Seconds(qkdStart), Seconds(qkdDur),
-    //                 /*pktSize*/ 400, /*pps*/ qkdPps);
-    // } else {
-    //   man.host[qSrc]->AddApplication(qkd);
-    //   qkd->Configure(man.host[qSrc], ifs.GetAddress(qDst), /*dport*/ 5555,
-    //                 Seconds(qkdStart), Seconds(qkdDur),
-    //                 /*pktSize*/ 400, /*pps*/ qkdPps);
-    // }
 
     // QKD control trickle (out-of-band model): small UDP from qSrc -> qDst with configurable marking
     Ptr<QkdWindowApp> qctrlApp = CreateObject<QkdWindowApp>();
@@ -3976,13 +3963,6 @@ private:
     };
     Simulator::Schedule(Seconds(5.0), classicalFn);  // Start after 5 seconds
 
-    // Legacy simple controller (disabled - using QkdBiasController instead)
-    // Ptr<ControllerApp> qkdCtrl = CreateObject<ControllerApp>();
-    // qkdCtrl->SetPeriod(Seconds(0.5)); 
-    // (usingCsv ? hostByIndex[0] : man.host[0])->AddApplication(qkdCtrl);
-    // qkdCtrl->AddDevice(alice); 
-    // qkdCtrl->AddDevice(bob);
-    // qkdCtrl->SetStartTime(Seconds(0.0));
 
     // Schedule error summary for simulation teardown
     if (g_verbosity >= 1) {
