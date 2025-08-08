@@ -72,7 +72,21 @@ private:
 };
 
 // QKD: NetDevice (quantum module on a node)
-struct QkdStats { uint32_t nXX=0, nZZ=0, errX=0, errZ=0; double qberX=0.0; };
+struct QkdStats { 
+  uint32_t nXX=0, nZZ=0, errX=0, errZ=0; 
+  double qberX=0.0;
+  
+  // Add proper combined QBER calculation
+  double GetCombinedQBER() const {
+    uint32_t totalDetected = nXX + nZZ;
+    uint32_t totalErrors = errX + errZ;
+    return (totalDetected > 0) ? double(totalErrors) / totalDetected : 0.0;
+  }
+  
+  double GetQberZ() const {
+    return (nZZ > 0) ? double(errZ) / nZZ : 0.0;
+  }
+};
 
 // QKD: Meta Logger for ML Training Pipeline (JSONL telemetry sink)
 struct WindowStats {
@@ -236,8 +250,12 @@ private:
   double m_pZ_rx = 0.9;
 
   // intrinsic (non-depolarization) error floors per basis
-  double m_eZ0 = 0.01;   // adjust as needed
-  double m_eX0 = 0.02;
+  // Intrinsic error floors for matched-basis measurements
+  // NOTE: Set equal for polarization BB84 - both bases share same optics after alignment
+  // For phase-encoded systems, X-basis may have higher error due to interferometer imperfections
+  // TODO: Could be derived from physical parameters (misalignment angle, visibility, etc.)
+  double m_eZ0 = 0.015;   // Z-basis intrinsic error floor  
+  double m_eX0 = 0.015;   // X-basis intrinsic error floor (equal for polarization setup)
 
   // Realistic detection parameters
   double m_eta = 0.15;          // detection efficiency (0..1)
@@ -490,8 +508,19 @@ struct SessionId {
 };
 
 struct SessionView { 
-  uint32_t buf=0, lastBits=0, nXX=0, nZZ=0; 
+  uint32_t buf=0, lastBits=0, nXX=0, nZZ=0, errX=0, errZ=0; 
   double qberX=0.0; 
+  
+  // Add proper combined QBER calculation
+  double GetCombinedQBER() const {
+    uint32_t totalDetected = nXX + nZZ;
+    uint32_t totalErrors = errX + errZ;
+    return (totalDetected > 0) ? double(totalErrors) / totalDetected : 0.0;
+  }
+  
+  double GetQberZ() const {
+    return (nZZ > 0) ? double(errZ) / nZZ : 0.0;
+  }
 };
 
 class SessionManager {
@@ -513,6 +542,8 @@ public:
     e.view.lastBits = e.km.LastWindowBits();
     e.view.nXX = w.nXX; 
     e.view.nZZ = w.nZZ; 
+    e.view.errX = w.errX;
+    e.view.errZ = w.errZ;
     e.view.qberX = w.qberX;
   }
   
@@ -542,7 +573,7 @@ public:
     e.km.Update(w.nXX, w.nZZ, w.qberX);
     e.view.buf = e.km.Buffer();
     e.view.lastBits = e.km.LastWindowBits();
-    e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.qberX = w.qberX;
+    e.view.nXX = w.nXX; e.view.nZZ = w.nZZ; e.view.errX = w.errX; e.view.errZ = w.errZ; e.view.qberX = w.qberX;
     m_lastCommitted[s] = wid;
   }
   uint32_t Drain(SessionId s, uint32_t n){ 
@@ -1034,7 +1065,7 @@ public:
   double GetQber() const {
     if (m_tx) {
       const auto& stats = m_tx->GetRollingStats();
-      return stats.qberX;
+      return stats.GetCombinedQBER();  // Use proper combined QBER!
     }
     return 0.0;
   }
@@ -1167,20 +1198,9 @@ private:
   void Tick(Ptr<QkdSessionLoop> loop) {
     double qber = loop->GetQber();
     double pZ = loop->GetBasisBias();
-    
-    std::cout << "DEBUG: RuleServo t=" << Simulator::Now().GetSeconds() 
-              << "s, QBER=" << qber << ", pZ=" << pZ << " -> ";
 
-    if (qber > m_hi && pZ > 0.5) {
-      pZ -= m_step;
-      std::cout << "decreased to " << pZ;
-    } else if (qber < m_lo && pZ < 0.95) {
-      pZ += m_step;
-      std::cout << "increased to " << pZ;
-    } else {
-      std::cout << "no change";
-    }
-    std::cout << std::endl;
+    if (qber > m_hi && pZ > 0.5) pZ -= m_step;
+    if (qber < m_lo && pZ < 0.95) pZ += m_step;
 
     loop->SetBasisBias(pZ);
 
@@ -3902,8 +3922,10 @@ private:
       std::cout << "Simulation duration: " << simTime << "s" << std::endl;
       std::cout << "Final key buffer: " << finalKeyBits << " bits" << std::endl;
       std::cout << "Average key rate: " << std::fixed << std::setprecision(1) << keyRate << " bps" << std::endl;
-      std::cout << "Session QBER: " << std::setprecision(4) << v.qberX << std::endl;
+      std::cout << "Session QBER: " << std::setprecision(4) << v.GetCombinedQBER() << std::endl;
       std::cout << "Session nXX: " << v.nXX << ", nZZ: " << v.nZZ << std::endl;
+      std::cout << "QBER breakdown - X-basis: " << std::setprecision(4) << v.qberX 
+                << ", Z-basis: " << std::setprecision(4) << v.GetQberZ() << std::endl;
       
       // Performance assessment based on key rate
       if (keyRate > 1000) {
@@ -3917,11 +3939,11 @@ private:
       }
       
       // Security assessment based on QBER
-      if (v.qberX < 0.02) {
+      if (v.GetCombinedQBER() < 0.02) {
         std::cout << "Security: EXCELLENT (QBER < 2%)" << std::endl;
-      } else if (v.qberX < 0.05) {
+      } else if (v.GetCombinedQBER() < 0.05) {
         std::cout << "Security: GOOD (QBER < 5%)" << std::endl;
-      } else if (v.qberX < 0.11) {
+      } else if (v.GetCombinedQBER() < 0.11) {
         std::cout << "Security: MARGINAL (QBER < 11%)" << std::endl;
       } else {
         std::cout << "Security: COMPROMISED (QBER >= 11%)" << std::endl;
