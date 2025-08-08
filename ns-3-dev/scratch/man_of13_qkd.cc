@@ -57,12 +57,18 @@ public:
   void Attach(Ptr<NetDevice> dev, double lambdaNm);           // register device+λ
   void UpdateClassicalLoad(double lambdaNm, double mbps);     // feed classical Mbps
   double GetClassicalLoad(double lambdaNm) const;             // retrieve current load
+  
+  // Link ID management for multi-link topologies
+  void SetLinkId(uint32_t linkId) { m_linkId = linkId; }
+  uint32_t GetLinkId() const { return m_linkId; }
+  
   struct BatchOutcome { uint32_t nTx, nLost, nDepol; };
   BatchOutcome Propagate(uint32_t nPulses, double lambdaNm, double baseDepol); // batch sim
   int64_t AssignStreams(int64_t stream);                      // tie RNG to ns-3 streams
   // Channel plumbing:
   std::size_t GetNDevices() const override; Ptr<NetDevice> GetDevice(std::size_t i) const override;
 private:
+  uint32_t m_linkId = 0;  // Unique identifier for this quantum link
   struct Port { Ptr<NetDevice> dev; double lambdaNm; double mbps=0.0; };
   std::vector<Port> m_ports;
   std::unordered_map<double,double> m_sidebandLoads; // λ -> Mbps (no attached dev required)
@@ -981,8 +987,15 @@ private:
       // Get current Tx bias
       auto [pZtx, pZrx] = m_tx->GetBiases();
       
+      // Get the actual quantum link ID (not node ID)
+      uint32_t actualLinkId = 0;
+      Ptr<qkd::QkdFiberChannel> qch = DynamicCast<qkd::QkdFiberChannel>(m_tx->GetChannel());
+      if (qch) {
+        actualLinkId = qch->GetLinkId();
+      }
+      
       qkd::WindowStats ws{
-        static_cast<uint32_t>(m_sid.src), // linkId (using source node ID)
+        actualLinkId, // Use actual quantum link ID, not source node ID
         m.winId,
         keyRate_bps,
         pw->second.qberX,
@@ -3737,6 +3750,11 @@ private:
     // --- QKD Layer Setup (after classical link A<->B is built) ---
     Ptr<qkd::QkdFiberChannel> qch = CreateObject<qkd::QkdFiberChannel>();
     qch->AssignStreams(42);   // keep your run/seed policy consistent
+    
+    // Assign unique link ID for proper MetaLogger identification
+    // Format: (qSrc << 16) | qDst to ensure uniqueness across all possible src->dst pairs
+    uint32_t uniqueLinkId = (static_cast<uint32_t>(qSrc) << 16) | static_cast<uint32_t>(qDst);
+    qch->SetLinkId(uniqueLinkId);
 
     Ptr<qkd::QkdNetDevice> alice = CreateObject<qkd::QkdNetDevice>();
     alice->SetNode(HostNode(qSrc)); 
