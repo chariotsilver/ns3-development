@@ -1023,6 +1023,13 @@ public:
     m_dyn=dynamicBias; m_ml=ml;
   }
   void BindSiftingApp(Ptr<QkdSiftingApp> siftApp) { m_siftApp = siftApp; }
+  
+  // Method to set basis bias on both TX and RX devices (for baseline controllers)
+  void SetBasisBias(double pZ) {
+    if (m_tx) m_tx->SetBasisBias(pZ);
+    if (m_rx) m_rx->SetBasisBias(pZ);
+  }
+  
   void StartApplication() override {
     std::cout << "DEBUG: QkdSessionLoop StartApplication() at t=" << Simulator::Now().GetSeconds() << "s, window=" << m_tw.GetSeconds() << "s" << std::endl;
     m_run=true;
@@ -1096,6 +1103,30 @@ private:
   }
   Ptr<Node> m_me; Ptr<Socket> m_sock; uint16_t m_port{9753}; uint8_t m_dscp{0xC0};
 };
+
+// Baseline #1: Static Bias Controller
+// Purpose: Fixed-policy benchmark for ML comparison
+class StaticBiasController : public Object {
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("ns3::StaticBiasController")
+                          .SetParent<Object>()
+                          .SetGroupName("QKD");
+    return tid;
+  }
+
+  StaticBiasController() : m_pZ(0.9) {}
+
+  void SetBias(double pZ) { m_pZ = pZ; }
+
+  void Attach(Ptr<QkdSessionLoop> loop) {
+    loop->SetBasisBias(m_pZ);
+  }
+
+private:
+  double m_pZ;
+};
+
 } // namespace ns3
 
 // Link Failure and Recovery Module for Network Robustness Testing
@@ -3508,10 +3539,20 @@ private:
     ns3::Names::Add("meta", meta);
     std::cout << "MetaLogger initialized: run-" << runId << ".jsonl" << std::endl;
     
+    // --- Static Bias Controller Setup ---
+    // Baseline #1: Fixed-policy benchmark for ML comparison
+    Ptr<StaticBiasController> staticController = CreateObject<StaticBiasController>();
+    staticController->SetBias(0.90);
+    std::cout << "StaticBiasController initialized: pZ = 0.90" << std::endl;
+    
     // --- QKD Session Loop Application Setup ---
     // Replace scattered timers with unified per-session orchestrator
     auto loop = CreateObject<QkdSessionLoop>();
     ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(loop);
+    
+    // Attach static bias controller to set fixed bias
+    staticController->Attach(loop);
+    
     loop->Configure(&sessions, sAB, alice, bob,
                     /*batch*/ MilliSeconds(10), /*pulses*/ qkdPulseRate,
                     /*window*/ MilliSeconds(qkdWindowSec*1000),

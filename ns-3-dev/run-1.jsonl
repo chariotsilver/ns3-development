@@ -1,3 +1,9 @@
 {"ts":3.40101,"linkId":0,"winId":8,"keyRate_bps":221970,"qber":0.0220842,"classLoad_bps":7.8389e+07,"pZ_tx":0.8}
 {"ts":5.50829,"linkId":0,"winId":15,"keyRate_bps":224700,"qber":0.0190088,"classLoad_bps":2.72959e+07,"pZ_tx":0.8}
 {"ts":8.01501,"linkId":0,"winId":24,"keyRate_bps":222520,"qber":0.022508,"classLoad_bps":5.64536e+07,"pZ_tx":0.8}
+{"ts":11.7244,"linkId":0,"winId":39,"keyRate_bps":226070,"qber":0.0203136,"classLoad_bps":2.90038e+07,"pZ_tx":0.8}
+{"ts":12.8363,"linkId":0,"winId":41,"keyRate_bps":214810,"qber":0.0267041,"classLoad_bps":2.13794e+07,"pZ_tx":0.8}
+{"ts":14.5469,"linkId":0,"winId":46,"keyRate_bps":223430,"qber":0.0210748,"classLoad_bps":6.2605e+07,"pZ_tx":0.8}
+{"ts":17.0637,"linkId":0,"winId":55,"keyRate_bps":225750,"qber":0.0203354,"classLoad_bps":5.6194e+07,"pZ_tx":0.8}
+{"ts":17.714,"linkId":0,"winId":56,"keyRate_bps":224810,"qber":0.0202631,"classLoad_bps":3.58273e+07,"pZ_tx":0.8}
+{"ts":18.6041,"linkId":0,"winId":174,"keyRate_bps":223930,"qber":0.0219207,"classLoad_bps":2.0478e+07,"pZ_tx":0.8}
