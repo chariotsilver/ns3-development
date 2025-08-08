@@ -944,6 +944,12 @@ private:
 
     for (const auto& cfg : links)
     {
+      // Fail-fast check for node index validation
+      NS_ABORT_MSG_IF(cfg.srcNode >= nodes.size() ||
+                      cfg.dstNode >= nodes.size(),
+                      "QkdTopologyBuilder: node index out of range. "
+                      "Did you forget to populate the 'nodes' vector?");
+      
       Ptr<QkdFiberChannel> chan = MakeQuantum(cfg);
       topo.channels[cfg.linkId] = chan;
 
@@ -3064,7 +3070,16 @@ private:
 // Classical Load Monitor Application
 class ClassicalLoadMonitor : public Application {
 public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("ClassicalLoadMonitor")
+        .SetParent<Application>()
+        .AddConstructor<ClassicalLoadMonitor>();
+    return tid;
+  }
+  
+  ClassicalLoadMonitor() : m_probe(nullptr), m_counter(0) {} // Default constructor for NS-3
   ClassicalLoadMonitor(qkd::ClassicalLoadProbe* probe) : m_probe(probe), m_counter(0) {}
+  void SetProbe(qkd::ClassicalLoadProbe* probe) { m_probe = probe; }
   void SetMonitoringPeriod(Time period) { m_period = period; }
   
   void StartApplication() override {
@@ -4048,42 +4063,77 @@ private:
                                InetSocketAddress(Ipv4Address::GetAny(), 5555));
     ApplicationContainer qctrlSinkApp = qctrlSink.Install(HostNode(qDst));
 
-    // --- QKD Layer Setup (after classical link A<->B is built) ---
-    Ptr<qkd::QkdFiberChannel> qch = CreateObject<qkd::QkdFiberChannel>();
-    qch->AssignStreams(42);   // keep your run/seed policy consistent
+    // --- QKD Layer Setup using Topology Builder ---
+    // Create QKD topology builder for modern multi-hop architecture
+    Ptr<qkd::QkdTopologyBuilder> topoBuilder = CreateObject<qkd::QkdTopologyBuilder>();
     
-    // Assign unique link ID for proper MetaLogger identification
-    // Format: (qSrc << 16) | qDst to ensure uniqueness across all possible src->dst pairs
-    uint32_t uniqueLinkId = (static_cast<uint32_t>(qSrc) << 16) | static_cast<uint32_t>(qDst);
-    qch->SetLinkId(uniqueLinkId);
-
-    Ptr<qkd::QkdNetDevice> alice = CreateObject<qkd::QkdNetDevice>();
-    alice->SetNode(HostNode(qSrc)); 
-    alice->SetChannel(qch); 
-    alice->SetLambda(1550.12); 
-    alice->SetBasisBias(0.9);
-    alice->AssignStreams(0);  // Assign stream 0 to Alice
-
-    Ptr<qkd::QkdNetDevice> bob = CreateObject<qkd::QkdNetDevice>();
-    bob->SetNode(HostNode(qDst));   
-    bob->SetChannel(qch);   
-    bob->SetLambda(1550.12);   
-    bob->SetBasisBias(0.9);
-    bob->AssignStreams(1);    // Assign stream 1 to Bob
+    // Create simple single-link topology configuration for current experiment
+    nlohmann::json qkdConfig;
+    qkdConfig["links"] = nlohmann::json::array();
+    qkdConfig["links"].push_back({
+        {"src", qSrc},
+        {"dst", qDst}, 
+        {"length_km", 10.0},
+        {"loss_db", 4.0},
+        {"lambda_nm", 1550.12}
+    });
     
-    // Assign stream to classical load RNG for reproducibility
-    classicalLoadRng->SetStream(2);  // Assign stream 2 to classical load generator
-
-    // --- Classical Load Monitoring Setup ---
-    // Create classical load probe to monitor traffic and feed into QKD channel
-    qkd::ClassicalLoadProbe classicalProbe(qch, 1530.0); // 1530 nm classical wavelength
+    // Get all nodes for topology builder
+    std::vector<Ptr<Node>> allNodes;
+    if (usingExtTopo) {                  // CSV / JSON
+      for (auto n : topo.host) allNodes.push_back(n);
+      for (auto n : topo.sw)   allNodes.push_back(n);
+    } else {                             // built-in MAN
+      for (auto n : man.host)  allNodes.push_back(n);
+      for (auto n : man.sw)    allNodes.push_back(n);  // optional
+    }
     
-    // --- Session Management Setup ---
-    // Create session manager to track key buffers and statistics per (src,dst) pair
+    // Build quantum network topology
+    qkd::QkdTopology qkdTopo = topoBuilder->BuildFromJson(qkdConfig, allNodes);
+    
+    // Declare variables that need to be accessible throughout main()
+    Ptr<qkd::QkdFiberChannel> qch;
+    Ptr<qkd::QkdNetDevice> alice, bob;
     static qkd::SessionManager sessions;
     qkd::SessionId sAB{qSrc, qDst};
-    sessions.Create(sAB);
-    sessions.Bind(sAB, alice, bob);
+    std::unique_ptr<qkd::ClassicalLoadProbe> classicalProbe;
+    
+    // Configure the single quantum link
+    if (!qkdTopo.channels.empty()) {
+        auto linkId = qkdTopo.linkConfigs[0].linkId;
+        qch = qkdTopo.channels[linkId];
+        qch->AssignStreams(42);   // keep your run/seed policy consistent
+        
+        // Get the device pair for this link
+        auto devicePair = qkdTopo.devices[linkId];
+        alice = devicePair.first;
+        bob = devicePair.second;
+        
+        // Configure devices
+        alice->SetBasisBias(0.9);
+        alice->AssignStreams(0);  // Assign stream 0 to Alice
+        bob->SetBasisBias(0.9); 
+        bob->AssignStreams(1);    // Assign stream 1 to Bob
+        
+        // Assign stream to classical load RNG for reproducibility
+        classicalLoadRng->SetStream(2);  // Assign stream 2 to classical load generator
+
+        // --- Classical Load Monitoring Setup ---
+        // Create classical load probe to monitor traffic and feed into QKD channel
+        classicalProbe = std::make_unique<qkd::ClassicalLoadProbe>(qch, 1530.0); // 1530 nm classical wavelength
+        
+        // --- Session Management Setup ---
+        // Create session manager to track key buffers and statistics per (src,dst) pair
+        sessions.Create(sAB);
+        sessions.Bind(sAB, alice, bob);
+        
+        // Store quantum topology for later use
+        // This enables future multi-hop extensions
+        std::cout << "QKD topology built: " << qkdTopo.channels.size() << " quantum links" << std::endl;
+    } else {
+        std::cerr << "ERROR: No quantum channels configured!" << std::endl;
+        return 1;
+    }
     
     // --- ML Bridge Setup ---
     // Build (or reuse) the ML bridge once
@@ -4175,7 +4225,8 @@ private:
     loop->BindSiftingApp(siftA);
     
     // Create and install classical load monitoring application
-    Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>(&classicalProbe);
+    Ptr<ClassicalLoadMonitor> loadMonitor = CreateObject<ClassicalLoadMonitor>();
+    loadMonitor->SetProbe(classicalProbe.get());
     loadMonitor->SetMonitoringPeriod(MilliSeconds(100)); // Monitor every 100ms
     
     // Install on the same node as Alice (or any node - it's just monitoring)
