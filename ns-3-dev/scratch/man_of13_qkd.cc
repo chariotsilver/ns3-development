@@ -1030,6 +1030,23 @@ public:
     if (m_rx) m_rx->SetBasisBias(pZ);
   }
   
+  // Getter methods for baseline controllers
+  double GetQber() const {
+    if (m_tx) {
+      const auto& stats = m_tx->GetRollingStats();
+      return stats.qberX;
+    }
+    return 0.0;
+  }
+  
+  double GetBasisBias() const {
+    if (m_tx) {
+      auto [pZtx, pZrx] = m_tx->GetBiases();
+      return pZtx;  // Return TX bias
+    }
+    return 0.9;  // Default bias
+  }
+  
   void StartApplication() override {
     std::cout << "DEBUG: QkdSessionLoop StartApplication() at t=" << Simulator::Now().GetSeconds() << "s, window=" << m_tw.GetSeconds() << "s" << std::endl;
     m_run=true;
@@ -1125,6 +1142,54 @@ public:
 
 private:
   double m_pZ;
+};
+
+// Baseline #2: Rule-Based Servo Controller
+// Purpose: Simple heuristic controller for control loop latency testing
+class RuleServoController : public Object {
+public:
+  static TypeId GetTypeId() {
+    static TypeId tid = TypeId("ns3::RuleServoController")
+                          .SetParent<Object>()
+                          .SetGroupName("QKD");
+    return tid;
+  }
+
+  RuleServoController(double step = 0.05, double hi = 0.04, double lo = 0.01)
+    : m_step(step), m_hi(hi), m_lo(lo) {}
+
+  void Attach(Ptr<QkdSessionLoop> loop) {
+    m_targets.push_back(loop);
+    Simulator::Schedule(Seconds(1.0), &RuleServoController::Tick, this, loop);
+  }
+
+private:
+  void Tick(Ptr<QkdSessionLoop> loop) {
+    double qber = loop->GetQber();
+    double pZ = loop->GetBasisBias();
+    
+    std::cout << "DEBUG: RuleServo t=" << Simulator::Now().GetSeconds() 
+              << "s, QBER=" << qber << ", pZ=" << pZ << " -> ";
+
+    if (qber > m_hi && pZ > 0.5) {
+      pZ -= m_step;
+      std::cout << "decreased to " << pZ;
+    } else if (qber < m_lo && pZ < 0.95) {
+      pZ += m_step;
+      std::cout << "increased to " << pZ;
+    } else {
+      std::cout << "no change";
+    }
+    std::cout << std::endl;
+
+    loop->SetBasisBias(pZ);
+
+    // Schedule next tick
+    Simulator::Schedule(Seconds(1.0), &RuleServoController::Tick, this, loop);
+  }
+
+  std::vector<Ptr<QkdSessionLoop>> m_targets;
+  double m_step, m_hi, m_lo;
 };
 
 } // namespace ns3
@@ -2975,6 +3040,7 @@ private:
     bool enableMlBridge = false;      // Enable ML bridge for external control
     std::string mlHost = "127.0.0.1"; // ML bridge host
     uint16_t mlPort = 8888;           // ML bridge port
+    std::string controllerType = "static";  // Controller type: "static", "rule", or "ml"
     
     CommandLine cmd;
     cmd.AddValue("seed", "RNG seed", seed);
@@ -3008,6 +3074,7 @@ private:
     cmd.AddValue("enableMlBridge", "Enable ML bridge for external QKD control", enableMlBridge);
     cmd.AddValue("mlHost", "ML bridge host address", mlHost);
     cmd.AddValue("mlPort", "ML bridge port number", mlPort);
+    cmd.AddValue("controllerType", "QKD bias controller type: static, rule, or ml", controllerType);
     cmd.Parse(argc, argv);
 
     // Calculate final simulation stop time for validation
@@ -3539,19 +3606,40 @@ private:
     ns3::Names::Add("meta", meta);
     std::cout << "MetaLogger initialized: run-" << runId << ".jsonl" << std::endl;
     
-    // --- Static Bias Controller Setup ---
-    // Baseline #1: Fixed-policy benchmark for ML comparison
-    Ptr<StaticBiasController> staticController = CreateObject<StaticBiasController>();
-    staticController->SetBias(0.90);
-    std::cout << "StaticBiasController initialized: pZ = 0.90" << std::endl;
+    // --- Bias Controller Setup ---
+    // Choose controller based on command line parameter
+    Ptr<StaticBiasController> staticController = nullptr;
+    Ptr<RuleServoController> ruleController = nullptr;
+    
+    if (controllerType == "static") {
+        // Baseline #1: Fixed-policy benchmark for ML comparison
+        staticController = CreateObject<StaticBiasController>();
+        staticController->SetBias(0.90);
+        std::cout << "StaticBiasController initialized: pZ = 0.90" << std::endl;
+    } else if (controllerType == "rule") {
+        // Baseline #2: Simple heuristic controller
+        ruleController = CreateObject<RuleServoController>(0.05, 0.04, 0.01);
+        std::cout << "RuleServoController initialized: step=0.05, hi=0.04, lo=0.01" << std::endl;
+    } else if (controllerType == "ml") {
+        std::cout << "ML controller selected (handled via ML bridge)" << std::endl;
+    } else {
+        std::cerr << "Warning: Unknown controller type '" << controllerType << "', using static controller" << std::endl;
+        staticController = CreateObject<StaticBiasController>();
+        staticController->SetBias(0.90);
+        std::cout << "StaticBiasController initialized: pZ = 0.90 (fallback)" << std::endl;
+    }
     
     // --- QKD Session Loop Application Setup ---
     // Replace scattered timers with unified per-session orchestrator
     auto loop = CreateObject<QkdSessionLoop>();
     ( usingCsv ? hostByIndex[qSrc] : man.host[qSrc] )->AddApplication(loop);
     
-    // Attach static bias controller to set fixed bias
-    staticController->Attach(loop);
+    // Attach appropriate bias controller
+    if (staticController) {
+        staticController->Attach(loop);
+    } else if (ruleController) {
+        ruleController->Attach(loop);
+    }
     
     loop->Configure(&sessions, sAB, alice, bob,
                     /*batch*/ MilliSeconds(10), /*pulses*/ qkdPulseRate,
